@@ -127,18 +127,18 @@ fn mount_and_read_presigned_url() {
             let _ = stream.write_all(response.as_bytes());
             return;
         }
-        if let Some(range_line) = request.lines().find(|line| line.starts_with("Range:")) {
-            if range_line.contains("bytes=0-0") {
-                let response = concat!(
-                    "HTTP/1.1 206 Partial Content\r\n",
-                    "Content-Length: 1\r\n",
-                    "Content-Range: bytes 0-0/5\r\n",
-                    "\r\n",
-                    "h"
-                );
-                let _ = stream.write_all(response.as_bytes());
-                return;
-            }
+        if let Some(range_line) = request.lines().find(|line| line.starts_with("Range:"))
+            && range_line.contains("bytes=0-0")
+        {
+            let response = concat!(
+                "HTTP/1.1 206 Partial Content\r\n",
+                "Content-Length: 1\r\n",
+                "Content-Range: bytes 0-0/5\r\n",
+                "\r\n",
+                "h"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            return;
         }
         let response = concat!(
             "HTTP/1.1 200 OK\r\n",
@@ -201,14 +201,17 @@ fn mount_and_read_with_block_cache_overlap() {
             return;
         }
         if let Some(range_line) = request.lines().find(|line| line.starts_with("Range:")) {
-            if let Some(range_value) = range_line.splitn(2, ':').nth(1) {
+            if let Some(range_value) = range_line.split_once(':').map(|(_, v)| v) {
                 let mut ranges = ranges_for_server.lock().expect("ranges lock");
                 ranges.push(range_value.trim().to_string());
             }
             let body = b"abcdef";
-            if let Some(range_value) = range_line.splitn(2, '=').nth(1) {
+            if let Some(range_value) = range_line.split_once('=').map(|(_, v)| v) {
                 let parts: Vec<&str> = range_value.trim().split('-').collect();
-                let start: usize = parts.get(0).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let start: usize = parts
+                    .first()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
                 let end: usize = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(start);
                 let end = end.min(body.len().saturating_sub(1));
                 let chunk = &body[start..=end];
@@ -418,8 +421,7 @@ fn mount_open_write_rejected() {
     let cache_dir = tmp.path().join("cache");
     fs::create_dir_all(&mountpoint).expect("mountpoint");
 
-    let manifest_content = format!(
-        r#"{{
+    let manifest_content = r#"{{
   "version": 1,
   "entries": [
     {{
@@ -427,8 +429,8 @@ fn mount_open_write_rejected() {
       "url": "http://127.0.0.1:1"
     }}
   ]
-}}"#,
-    );
+}}"#
+    .to_string();
     let manifest = write_manifest(tmp.path(), &manifest_content);
 
     let child = spawn_mount(&manifest, &mountpoint, &cache_dir, &[]);
@@ -464,15 +466,15 @@ fn mount_range_eof_returns_empty() {
             let _ = stream.write_all(response.as_bytes());
             return;
         }
-        if let Some(range_line) = request.lines().find(|line| line.starts_with("Range:")) {
-            if let Some(range_value) = range_line.splitn(2, '=').nth(1) {
-                let parts: Vec<&str> = range_value.trim().split('-').collect();
-                let start: usize = parts.get(0).and_then(|v| v.parse().ok()).unwrap_or(0);
-                if start >= 3 {
-                    let response = "HTTP/1.1 416 Range Not Satisfiable\r\n\r\n";
-                    let _ = stream.write_all(response.as_bytes());
-                    return;
-                }
+        if let Some(range_line) = request.lines().find(|line| line.starts_with("Range:"))
+            && let Some(range_value) = range_line.split_once('=').map(|(_, v)| v)
+        {
+            let parts: Vec<&str> = range_value.trim().split('-').collect();
+            let start: usize = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0);
+            if start >= 3 {
+                let response = "HTTP/1.1 416 Range Not Satisfiable\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes());
+                return;
             }
         }
         let response = concat!(

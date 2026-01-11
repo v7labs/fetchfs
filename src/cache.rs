@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::download_gate::DownloadGate;
+use crate::download_pool::DownloadPool;
 use crate::http::UrlDownloader;
 
 #[derive(Debug, Clone)]
@@ -133,27 +134,23 @@ impl Cache {
             return Ok(false);
         }
         let metadata = fs::metadata(&entry.data_path)?;
-        if let Some(expected_size) = expected.size {
-            if metadata.len() != expected_size {
-                warn!(
-                    "cache size mismatch for {:?}: expected {}, found {}",
-                    entry.data_path,
-                    expected_size,
-                    metadata.len()
-                );
-                return Ok(false);
-            }
+        if let Some(expected_size) = expected.size && metadata.len() != expected_size {
+            warn!(
+                "cache size mismatch for {:?}: expected {}, found {}",
+                entry.data_path,
+                expected_size,
+                metadata.len()
+            );
+            return Ok(false);
         }
-        if let Some(current_size) = current.size {
-            if metadata.len() != current_size {
-                warn!(
-                    "cache size mismatch for {:?}: meta {}, found {}",
-                    entry.data_path,
-                    current_size,
-                    metadata.len()
-                );
-                return Ok(false);
-            }
+        if let Some(current_size) = current.size && metadata.len() != current_size {
+            warn!(
+                "cache size mismatch for {:?}: meta {}, found {}",
+                entry.data_path,
+                current_size,
+                metadata.len()
+            );
+            return Ok(false);
         }
         Ok(true)
     }
@@ -163,6 +160,7 @@ impl Cache {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&entry.lock_path)?;
         file.lock_exclusive()?;
         Ok(file)
@@ -173,6 +171,7 @@ impl Cache {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&entry.lock_path)?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Some(file)),
@@ -207,10 +206,8 @@ impl Cache {
             return Err(err);
         }
         let mut meta = expected.clone();
-        if meta.size.is_none() {
-            if let Ok(metadata) = fs::metadata(&entry.data_path) {
-                meta.size = Some(metadata.len());
-            }
+        if meta.size.is_none() && let Ok(metadata) = fs::metadata(&entry.data_path) {
+            meta.size = Some(metadata.len());
         }
         Self::write_meta(entry, &meta)?;
         Ok(entry.data_path.clone())
@@ -222,12 +219,14 @@ impl Cache {
         expected: CacheMeta,
         downloader: std::sync::Arc<D>,
         download_gate: std::sync::Arc<DownloadGate>,
+        download_pool: std::sync::Arc<DownloadPool>,
     ) -> io::Result<PathBuf> {
         if Self::is_fresh(entry, &expected)? {
             debug!("cache hit for {:?}", entry.data_path);
             return Ok(entry.data_path.clone());
         }
 
+        // Create a placeholder so readers don't hit ENOENT while the background download starts.
         let _ = OpenOptions::new()
             .create(true)
             .append(true)
@@ -243,25 +242,25 @@ impl Cache {
 
         let data_path = entry.data_path.clone();
         let meta_path = entry.meta_path.clone();
-        std::thread::spawn(move || {
-            let _permit = download_gate.acquire();
-            let _lock = lock;
-            let result = downloader.download_full(&expected.url, &data_path);
-            if let Err(err) = result {
-                warn!("streaming download failed: {err}");
-                let _ = fs::remove_file(&data_path);
-                return;
-            }
-            let mut meta = expected;
-            if meta.size.is_none() {
-                if let Ok(metadata) = fs::metadata(&data_path) {
+        download_pool
+            .enqueue(move || {
+                let _permit = download_gate.acquire();
+                let _lock = lock;
+                let result = downloader.download_full(&expected.url, &data_path);
+                if let Err(err) = result {
+                    warn!("streaming download failed: {err}");
+                    let _ = fs::remove_file(&data_path);
+                    return;
+                }
+                let mut meta = expected;
+                if meta.size.is_none() && let Ok(metadata) = fs::metadata(&data_path) {
                     meta.size = Some(metadata.len());
                 }
-            }
-            if let Ok(raw) = serde_json::to_string(&meta) {
-                let _ = fs::write(&meta_path, raw);
-            }
-        });
+                if let Ok(raw) = serde_json::to_string(&meta) {
+                    let _ = fs::write(&meta_path, raw);
+                }
+            })
+            .map_err(|_| io::Error::other("streaming download pool unavailable"))?;
 
         Ok(entry.data_path.clone())
     }
@@ -335,12 +334,11 @@ impl Cache {
                 .checked_sub(Duration::from_secs(days * 24 * 60 * 60))
                 .unwrap_or(SystemTime::UNIX_EPOCH);
             for path in data_files.iter() {
-                if let Ok(metadata) = fs::metadata(path) {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified < threshold {
-                            remove_entry_files(path)?;
-                        }
-                    }
+                if let Ok(metadata) = fs::metadata(path)
+                    && let Ok(modified) = metadata.modified()
+                    && modified < threshold
+                {
+                    remove_entry_files(path)?;
                 }
             }
             data_files = list_data_files(&self.root)?;
@@ -399,10 +397,10 @@ fn list_data_files(root: &Path) -> io::Result<Vec<PathBuf>> {
             files.extend(list_data_files(&path)?);
             continue;
         }
-        if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-            if ext == "meta" || ext == "lock" || ext == "tmp" {
-                continue;
-            }
+        if let Some(ext) = path.extension().and_then(|s| s.to_str())
+            && (ext == "meta" || ext == "lock" || ext == "tmp")
+        {
+            continue;
         }
         files.push(path);
     }

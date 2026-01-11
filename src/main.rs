@@ -1,5 +1,6 @@
 mod cache;
 mod download_gate;
+mod download_pool;
 mod filesystem;
 mod fuse_fs;
 mod http;
@@ -8,16 +9,17 @@ mod tree;
 
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cache::{Cache, default_cache_dir};
 use crate::download_gate::DownloadGate;
+use crate::download_pool::DownloadPool;
 use crate::filesystem::FetchFs;
 use crate::fuse_fs::FuseFS;
 use crate::http::HttpClient;
@@ -102,11 +104,11 @@ fn main() -> ExitCode {
                 error!("mountpoint does not exist: {}", mountpoint.display());
                 return ExitCode::FAILURE;
             }
-            if let Ok(mut entries) = std::fs::read_dir(&mountpoint) {
-                if entries.next().is_some() {
-                    error!("mountpoint is not empty: {}", mountpoint.display());
-                    return ExitCode::FAILURE;
-                }
+            if let Ok(mut entries) = std::fs::read_dir(&mountpoint)
+                && entries.next().is_some()
+            {
+                error!("mountpoint is not empty: {}", mountpoint.display());
+                return ExitCode::FAILURE;
             }
 
             let manifest = match Manifest::load_from_path(&manifest) {
@@ -152,6 +154,7 @@ fn main() -> ExitCode {
                 block_cache,
                 Arc::new(downloader),
                 Arc::new(DownloadGate::new(max_concurrent)),
+                Arc::new(DownloadPool::new(max_concurrent)),
                 streaming,
             );
             let fuse_fs = FuseFS::new(fs);
@@ -225,25 +228,23 @@ fn init_logging(verbose: bool) {
         .try_init();
 }
 
-fn install_signal_handler(mountpoint: &PathBuf) -> Result<(), std::io::Error> {
+fn install_signal_handler(mountpoint: &Path) -> Result<(), std::io::Error> {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
     let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
-    let mountpoint = mountpoint.clone();
+    let mountpoint = mountpoint.to_path_buf();
     std::thread::spawn(move || {
-        for _signal in signals.forever() {
-            if let Err(err) = unmount_fs(&mountpoint) {
-                if err.kind() != std::io::ErrorKind::InvalidInput {
-                    eprintln!("warning: unmount failed: {err}");
-                }
-            }
-            break;
+        if let Some(_signal) = signals.forever().next()
+            && let Err(err) = unmount_fs(&mountpoint)
+            && err.kind() != std::io::ErrorKind::InvalidInput
+        {
+            warn!("unmount failed: {err}");
         }
     });
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn unmount_fs(mountpoint: &PathBuf) -> Result<(), std::io::Error> {
+fn unmount_fs(mountpoint: &Path) -> Result<(), std::io::Error> {
     let cstr = std::ffi::CString::new(mountpoint.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mountpoint"))?;
     let result = unsafe { libc::umount(cstr.as_ptr()) };
@@ -254,7 +255,7 @@ fn unmount_fs(mountpoint: &PathBuf) -> Result<(), std::io::Error> {
 }
 
 #[cfg(target_os = "macos")]
-fn unmount_fs(mountpoint: &PathBuf) -> Result<(), std::io::Error> {
+fn unmount_fs(mountpoint: &Path) -> Result<(), std::io::Error> {
     let cstr = std::ffi::CString::new(mountpoint.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mountpoint"))?;
     let result = unsafe { libc::unmount(cstr.as_ptr(), 0) };

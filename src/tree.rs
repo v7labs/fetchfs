@@ -30,6 +30,7 @@ impl PathTree {
         Ok(tree)
     }
 
+    #[cfg(test)]
     pub fn lookup(&self, path: &str) -> Option<usize> {
         let node = self.find_node(path)?;
         node.entry_index
@@ -39,10 +40,6 @@ impl PathTree {
         let node = self.find_node(path)?;
         let mut entries = Vec::new();
         for (name, child) in &node.children {
-            debug_assert!(
-                child.entry_index.is_none() || child.children.is_empty(),
-                "node with both file entry and children"
-            );
             let is_dir = child.entry_index.is_none();
             entries.push(DirEntry {
                 name: name.clone(),

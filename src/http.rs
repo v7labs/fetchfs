@@ -51,7 +51,7 @@ impl HttpClient {
             .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms))
             .timeout(std::time::Duration::from_millis(request_timeout_ms))
             .build()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(io::Error::other)?;
         Ok(Self {
             client,
             retries,
@@ -71,12 +71,12 @@ impl HttpClient {
             .client
             .head(url)
             .send()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| io::Error::other(format!("head request failed for {url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("head failed with status {}", response.status()),
-            ));
+            return Err(io::Error::other(format!(
+                "head failed for {url} with status {}",
+                response.status(),
+            )));
         }
         Ok(meta_from_headers(response.headers()))
     }
@@ -107,7 +107,7 @@ impl HttpClient {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "range request failed")
+            io::Error::other(format!("range request failed for {url}"))
         }))
     }
 
@@ -118,12 +118,12 @@ impl HttpClient {
             .get(url)
             .header(reqwest::header::RANGE, range)
             .send()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| io::Error::other(format!("range request failed for {url}: {err}")))?;
         let status = response.status();
         let headers = response.headers().clone();
         let data = response
             .bytes()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?
+            .map_err(io::Error::other)?
             .to_vec();
 
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -158,10 +158,10 @@ impl HttpClient {
             });
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("range request failed with status {}", status),
-        ))
+        Err(io::Error::other(format!(
+            "range request failed for {url} with status {}",
+            status,
+        )))
     }
 
     pub fn download_full_with_retry(&self, url: &str, dest: &Path) -> io::Result<()> {
@@ -180,7 +180,7 @@ impl HttpClient {
             }
         }
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "download failed")
+            io::Error::other(format!("download failed for {url}"))
         }))
     }
 
@@ -190,7 +190,7 @@ impl HttpClient {
             .get(url)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| io::Error::other(format!("range probe failed for {url}: {err}")))?;
         if !response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
         {
             return Ok(ObjectMeta::default());
@@ -212,12 +212,12 @@ impl HttpClient {
             .client
             .get(url)
             .send()
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(|err| io::Error::other(format!("download request failed for {url}: {err}")))?;
         if !response.status().is_success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("download failed with status {}", response.status()),
-            ));
+            return Err(io::Error::other(format!(
+                "download failed for {url} with status {}",
+                response.status(),
+            )));
         }
         let mut file = std::fs::File::create(dest)?;
         io::copy(&mut response, &mut file)?;

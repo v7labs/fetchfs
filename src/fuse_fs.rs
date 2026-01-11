@@ -408,6 +408,7 @@ mod tests {
             None,
             std::sync::Arc::new(http),
             std::sync::Arc::new(DownloadGate::new(1)),
+            std::sync::Arc::new(crate::download_pool::DownloadPool::new(1)),
             false,
         );
         let fuse = FuseFS::new(fs);
