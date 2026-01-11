@@ -141,7 +141,9 @@ impl FetchFs {
             let known_size = entry
                 .size
                 .or_else(|| self.ensure_meta(entry).and_then(|meta| meta.size));
-            if let Some(total) = known_size && (size as u64) >= total {
+            if let Some(total) = known_size
+                && (size as u64) >= total
+            {
                 let (_entry, data_path) = self.ensure_cached(entry)?;
                 return read_from_path(&data_path, offset, size);
             }
@@ -285,7 +287,8 @@ impl FetchFs {
                             cache_meta.mtime = result.meta.mtime;
                         }
                         let data_path =
-                            self.cache.store_bytes(&cache_entry, &result.data, &cache_meta)?;
+                            self.cache
+                                .store_bytes(&cache_entry, &result.data, &cache_meta)?;
                         drop(lock_file);
                         return read_from_path(&data_path, offset, size);
                     }
@@ -321,7 +324,8 @@ pub(crate) fn system_time_from_datetime(dt: DateTime<Utc>) -> SystemTime {
         return SystemTime::UNIX_EPOCH;
     }
     let nanos = dt.timestamp_subsec_nanos() as u64;
-    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+    SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_secs(secs as u64)
         + std::time::Duration::from_nanos(nanos)
 }
 
@@ -380,9 +384,7 @@ mod tests {
     fn block_cache_serializes_downloads_before_lock() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking");
+        listener.set_nonblocking(true).expect("nonblocking");
 
         let calls = Arc::new(AtomicUsize::new(0));
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -451,13 +453,12 @@ mod tests {
         let entry_first = entry.clone();
         let entry_second = entry.clone();
 
-        let first = thread::spawn(move || {
-            fs_first
-                .read_range(&entry_first, 0, 4)
-                .expect("read first")
-        });
+        let first =
+            thread::spawn(move || fs_first.read_range(&entry_first, 0, 4).expect("read first"));
 
-        ready_rx.recv_timeout(Duration::from_secs(2)).expect("ready");
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ready");
 
         let second = thread::spawn(move || {
             fs_second

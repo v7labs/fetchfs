@@ -121,7 +121,10 @@ mod tests {
             "back\\slash",
         ];
         for path in bad_paths {
-            assert!(normalize_path(path).is_err(), "path should be invalid: {path}");
+            assert!(
+                normalize_path(path).is_err(),
+                "path should be invalid: {path}"
+            );
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -13,14 +13,16 @@ impl DownloadPool {
         let worker_count = size.max(1);
         for _ in 0..worker_count {
             let receiver = Arc::clone(&receiver);
-            std::thread::spawn(move || loop {
-                let job = {
-                    let receiver = receiver.lock().expect("download pool receiver lock");
-                    receiver.recv()
-                };
-                match job {
-                    Ok(job) => job(),
-                    Err(_) => break,
+            std::thread::spawn(move || {
+                loop {
+                    let job = {
+                        let receiver = receiver.lock().expect("download pool receiver lock");
+                        receiver.recv()
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => break,
+                    }
                 }
             });
         }

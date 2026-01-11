@@ -134,7 +134,9 @@ impl Cache {
             return Ok(false);
         }
         let metadata = fs::metadata(&entry.data_path)?;
-        if let Some(expected_size) = expected.size && metadata.len() != expected_size {
+        if let Some(expected_size) = expected.size
+            && metadata.len() != expected_size
+        {
             warn!(
                 "cache size mismatch for {:?}: expected {}, found {}",
                 entry.data_path,
@@ -143,7 +145,9 @@ impl Cache {
             );
             return Ok(false);
         }
-        if let Some(current_size) = current.size && metadata.len() != current_size {
+        if let Some(current_size) = current.size
+            && metadata.len() != current_size
+        {
             warn!(
                 "cache size mismatch for {:?}: meta {}, found {}",
                 entry.data_path,
@@ -206,7 +210,9 @@ impl Cache {
             return Err(err);
         }
         let mut meta = expected.clone();
-        if meta.size.is_none() && let Ok(metadata) = fs::metadata(&entry.data_path) {
+        if meta.size.is_none()
+            && let Ok(metadata) = fs::metadata(&entry.data_path)
+        {
             meta.size = Some(metadata.len());
         }
         Self::write_meta(entry, &meta)?;
@@ -253,7 +259,9 @@ impl Cache {
                     return;
                 }
                 let mut meta = expected;
-                if meta.size.is_none() && let Ok(metadata) = fs::metadata(&data_path) {
+                if meta.size.is_none()
+                    && let Ok(metadata) = fs::metadata(&data_path)
+                {
                     meta.size = Some(metadata.len());
                 }
                 if let Ok(raw) = serde_json::to_string(&meta) {
@@ -450,8 +458,12 @@ mod tests {
     fn cache_entry_paths_are_stable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache = Cache::new(tmp.path());
-        let entry = cache.entry_for("https://example.com/file.txt").expect("entry");
-        let entry2 = cache.entry_for("https://example.com/file.txt").expect("entry2");
+        let entry = cache
+            .entry_for("https://example.com/file.txt")
+            .expect("entry");
+        let entry2 = cache
+            .entry_for("https://example.com/file.txt")
+            .expect("entry2");
 
         assert_eq!(entry.data_path, entry2.data_path);
         assert!(entry.data_path.starts_with(tmp.path()));

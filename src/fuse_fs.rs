@@ -54,7 +54,11 @@ impl FuseFS {
         let mut dir_paths = Vec::new();
         for (idx, entry) in fs.manifest.entries.iter().enumerate() {
             let mut current = String::new();
-            for segment in entry.path.split('/').take(entry.path.split('/').count() - 1) {
+            for segment in entry
+                .path
+                .split('/')
+                .take(entry.path.split('/').count() - 1)
+            {
                 if !current.is_empty() {
                     current.push('/');
                 }
@@ -174,7 +178,9 @@ impl FuseFS {
         if !cache_entry.data_path.exists() {
             return None;
         }
-        std::fs::metadata(cache_entry.data_path).ok().map(|m| m.len())
+        std::fs::metadata(cache_entry.data_path)
+            .ok()
+            .map(|m| m.len())
     }
 }
 
@@ -214,13 +220,7 @@ impl Filesystem for FuseFS {
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn getattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: Option<u64>,
-        reply: ReplyAttr,
-    ) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         let node = match self.node_for_inode(ino) {
             Some(node) => node,
             None => {

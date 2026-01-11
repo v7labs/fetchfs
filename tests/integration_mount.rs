@@ -208,10 +208,7 @@ fn mount_and_read_with_block_cache_overlap() {
             let body = b"abcdef";
             if let Some(range_value) = range_line.split_once('=').map(|(_, v)| v) {
                 let parts: Vec<&str> = range_value.trim().split('-').collect();
-                let start: usize = parts
-                    .first()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
+                let start: usize = parts.first().and_then(|v| v.parse().ok()).unwrap_or(0);
                 let end: usize = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(start);
                 let end = end.min(body.len().saturating_sub(1));
                 let chunk = &body[start..=end];
@@ -458,11 +455,7 @@ fn mount_range_eof_returns_empty() {
 
     let (addr, server_thread) = spawn_http_server(|request, stream| {
         if request.starts_with("HEAD") {
-            let response = concat!(
-                "HTTP/1.1 200 OK\r\n",
-                "Content-Length: 3\r\n",
-                "\r\n"
-            );
+            let response = concat!("HTTP/1.1 200 OK\r\n", "Content-Length: 3\r\n", "\r\n");
             let _ = stream.write_all(response.as_bytes());
             return;
         }

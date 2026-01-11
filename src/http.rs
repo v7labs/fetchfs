@@ -106,9 +106,7 @@ impl HttpClient {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::other(format!("range request failed for {url}"))
-        }))
+        Err(last_err.unwrap_or_else(|| io::Error::other(format!("range request failed for {url}"))))
     }
 
     fn get_range_once(&self, url: &str, start: u64, end: u64) -> io::Result<RangeResult> {
@@ -121,10 +119,7 @@ impl HttpClient {
             .map_err(|err| io::Error::other(format!("range request failed for {url}: {err}")))?;
         let status = response.status();
         let headers = response.headers().clone();
-        let data = response
-            .bytes()
-            .map_err(io::Error::other)?
-            .to_vec();
+        let data = response.bytes().map_err(io::Error::other)?.to_vec();
 
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
             let mut meta = meta_from_headers(&headers);
@@ -179,9 +174,7 @@ impl HttpClient {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::other(format!("download failed for {url}"))
-        }))
+        Err(last_err.unwrap_or_else(|| io::Error::other(format!("download failed for {url}"))))
     }
 
     fn head_range_fallback(&self, url: &str) -> io::Result<ObjectMeta> {
@@ -191,7 +184,8 @@ impl HttpClient {
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
             .map_err(|err| io::Error::other(format!("range probe failed for {url}: {err}")))?;
-        if !response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        if !response.status().is_success()
+            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
         {
             return Ok(ObjectMeta::default());
         }
@@ -208,11 +202,10 @@ impl HttpClient {
     }
 
     fn download_full_once(&self, url: &str, dest: &Path) -> io::Result<()> {
-        let mut response = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|err| io::Error::other(format!("download request failed for {url}: {err}")))?;
+        let mut response =
+            self.client.get(url).send().map_err(|err| {
+                io::Error::other(format!("download request failed for {url}: {err}"))
+            })?;
         if !response.status().is_success() {
             return Err(io::Error::other(format!(
                 "download failed for {url} with status {}",
@@ -259,8 +252,8 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
 
