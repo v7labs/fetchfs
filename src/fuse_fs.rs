@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use libc::{EIO, ENOENT, EROFS};
 
@@ -15,6 +15,10 @@ use crate::manifest::ManifestEntry;
 
 // Keep attrs fresh while files are fetched lazily.
 const TTL: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const NO_XATTR: i32 = libc::ENOATTR;
+#[cfg(not(target_os = "macos"))]
+const NO_XATTR: i32 = libc::ENOTSUP;
 
 #[derive(Debug, Clone)]
 struct NodeInfo {
@@ -210,7 +214,13 @@ impl Filesystem for FuseFS {
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: Option<u64>,
+        reply: ReplyAttr,
+    ) {
         let node = match self.node_for_inode(ino) {
             Some(node) => node,
             None => {
@@ -223,6 +233,41 @@ impl Filesystem for FuseFS {
             .and_then(|idx| self.fs.manifest.entries.get(idx));
         let attr = self.file_attr(ino, entry);
         reply.attr(&TTL, &attr);
+    }
+
+    fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        if self.node_for_inode(ino).is_none() {
+            reply.error(ENOENT);
+            return;
+        }
+        if (mask & libc::W_OK) != 0 {
+            reply.error(EROFS);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        if self.node_for_inode(ino).is_none() {
+            reply.error(ENOENT);
+            return;
+        }
+        reply.error(NO_XATTR);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, _size: u32, reply: ReplyXattr) {
+        if self.node_for_inode(ino).is_none() {
+            reply.error(ENOENT);
+            return;
+        }
+        reply.size(0);
     }
 
     fn readdir(
@@ -350,6 +395,17 @@ impl Filesystem for FuseFS {
     ) {
         let mut handles = self.handles.lock().expect("handles lock");
         handles.remove(&fh);
+        reply.ok();
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
         reply.ok();
     }
 
