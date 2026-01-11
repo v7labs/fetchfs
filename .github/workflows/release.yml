@@ -82,6 +82,7 @@ jobs:
     needs:
       - build-linux
       - build-macos
+    if: ${{ always() && needs.build-linux.result == 'success' && (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
