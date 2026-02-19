@@ -12,6 +12,7 @@ use libc::{EIO, ENOENT, EROFS};
 
 use crate::filesystem::FetchFs;
 use crate::manifest::ManifestEntry;
+use crate::syscall_trace::SyscallTracer;
 
 // Keep attrs fresh while files are fetched lazily.
 const TTL: Duration = Duration::from_secs(1);
@@ -33,10 +34,11 @@ pub struct FuseFS {
     inode_to_node: HashMap<u64, NodeInfo>,
     handles: Mutex<HashMap<u64, usize>>,
     next_fh: AtomicU64,
+    tracer: Option<SyscallTracer>,
 }
 
 impl FuseFS {
-    pub fn new(fs: FetchFs) -> Self {
+    pub fn new(fs: FetchFs, tracer: Option<SyscallTracer>) -> Self {
         let mut path_to_inode = HashMap::new();
         let mut inode_to_node = HashMap::new();
         let mut next_inode = 2u64;
@@ -101,6 +103,7 @@ impl FuseFS {
             inode_to_node,
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            tracer,
         }
     }
 
@@ -122,6 +125,10 @@ impl FuseFS {
 
     fn node_for_inode(&self, inode: u64) -> Option<&NodeInfo> {
         self.inode_to_node.get(&inode)
+    }
+
+    fn path_for_inode(&self, inode: u64) -> Option<&str> {
+        self.inode_to_node.get(&inode).map(|n| n.path.as_str())
     }
 
     fn file_attr(&self, inode: u64, entry: Option<&ManifestEntry>) -> FileAttr {
@@ -186,6 +193,10 @@ impl FuseFS {
 
 impl Filesystem for FuseFS {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if let Some(tracer) = &self.tracer {
+            let parent_path = self.path_for_inode(parent);
+            tracer.lookup(parent, name.to_string_lossy().as_ref(), parent_path);
+        }
         let parent_node = match self.node_for_inode(parent) {
             Some(node) => node,
             None => {
@@ -220,7 +231,10 @@ impl Filesystem for FuseFS {
         reply.entry(&TTL, &attr, 0);
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        if let Some(tracer) = &self.tracer {
+            tracer.getattr(ino, fh, self.path_for_inode(ino));
+        }
         let node = match self.node_for_inode(ino) {
             Some(node) => node,
             None => {
@@ -236,6 +250,9 @@ impl Filesystem for FuseFS {
     }
 
     fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        if let Some(tracer) = &self.tracer {
+            tracer.access(ino, mask, self.path_for_inode(ino));
+        }
         if self.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
@@ -251,10 +268,13 @@ impl Filesystem for FuseFS {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _name: &OsStr,
-        _size: u32,
+        name: &OsStr,
+        size: u32,
         reply: ReplyXattr,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.getxattr(ino, name.to_string_lossy().as_ref(), size, self.path_for_inode(ino));
+        }
         if self.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
@@ -262,7 +282,10 @@ impl Filesystem for FuseFS {
         reply.error(NO_XATTR);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, _size: u32, reply: ReplyXattr) {
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        if let Some(tracer) = &self.tracer {
+            tracer.listxattr(ino, size, self.path_for_inode(ino));
+        }
         if self.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
@@ -274,10 +297,13 @@ impl Filesystem for FuseFS {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.readdir(ino, fh, offset, self.path_for_inode(ino));
+        }
         let node = match self.node_for_inode(ino) {
             Some(node) => node,
             None => {
@@ -320,8 +346,11 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if (_flags & libc::O_ACCMODE) != libc::O_RDONLY {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if let Some(tracer) = &self.tracer {
+            tracer.open(ino, flags, self.path_for_inode(ino));
+        }
+        if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
             reply.error(EROFS);
             return;
         }
@@ -348,7 +377,7 @@ impl Filesystem for FuseFS {
     fn read(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -356,6 +385,9 @@ impl Filesystem for FuseFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.read(ino, fh, offset, size, self.path_for_inode(ino));
+        }
         let entry_index = {
             let handles = self.handles.lock().expect("handles lock");
             match handles.get(&fh) {
@@ -386,13 +418,16 @@ impl Filesystem for FuseFS {
     fn release(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
-        _flush: bool,
+        flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.release(ino, fh, flags, flush, self.path_for_inode(ino));
+        }
         let mut handles = self.handles.lock().expect("handles lock");
         handles.remove(&fh);
         reply.ok();
@@ -401,26 +436,32 @@ impl Filesystem for FuseFS {
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.flush(ino, fh, lock_owner, self.path_for_inode(ino));
+        }
         reply.ok();
     }
 
     fn write(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _offset: i64,
-        _data: &[u8],
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
         _write_flags: u32,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        if let Some(tracer) = &self.tracer {
+            tracer.write(ino, fh, offset, data.len() as u32, flags, self.path_for_inode(ino));
+        }
         reply.error(EROFS);
     }
 }
@@ -467,7 +508,7 @@ mod tests {
             std::sync::Arc::new(crate::download_pool::DownloadPool::new(1)),
             false,
         );
-        let fuse = FuseFS::new(fs);
+        let fuse = FuseFS::new(fs, None);
 
         assert!(fuse.inode_for_path("").is_some());
         assert!(fuse.inode_for_path("data").is_some());
