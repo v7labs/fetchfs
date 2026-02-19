@@ -5,6 +5,7 @@ mod filesystem;
 mod fuse_fs;
 mod http;
 mod manifest;
+mod syscall_trace;
 mod tree;
 
 #[cfg(unix)]
@@ -24,6 +25,7 @@ use crate::filesystem::FetchFs;
 use crate::fuse_fs::FuseFS;
 use crate::http::HttpClient;
 use crate::manifest::Manifest;
+use crate::syscall_trace::SyscallTracer;
 
 #[derive(Parser)]
 #[command(
@@ -67,6 +69,8 @@ enum Commands {
         streaming: bool,
         #[arg(long, default_value_t = false)]
         allow_other: bool,
+        #[arg(long)]
+        trace_socket: Option<PathBuf>,
     },
     Clean {
         #[arg(long)]
@@ -97,6 +101,7 @@ fn main() -> ExitCode {
             block_cache_size,
             streaming,
             allow_other,
+            trace_socket,
         } => {
             init_logging(verbose);
 
@@ -157,7 +162,21 @@ fn main() -> ExitCode {
                 Arc::new(DownloadPool::new(max_concurrent)),
                 streaming,
             );
-            let fuse_fs = FuseFS::new(fs);
+            let tracer = if let Some(socket_path) = trace_socket {
+                match SyscallTracer::new(&socket_path) {
+                    Ok(tracer) => {
+                        info!("syscall tracing enabled: {}", socket_path.display());
+                        Some(tracer)
+                    }
+                    Err(err) => {
+                        error!("failed to create syscall tracer at {}: {err}", socket_path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            };
+            let fuse_fs = FuseFS::new(fs, tracer);
             let mount_options = FuseFS::mount_options(allow_other);
 
             info!(
