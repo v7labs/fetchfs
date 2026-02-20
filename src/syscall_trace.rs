@@ -95,14 +95,15 @@ pub enum SyscallArgs<'a> {
 
 pub struct SyscallTracer {
     socket: UnixDatagram,
+    filter: Option<Vec<String>>,
 }
 
 impl SyscallTracer {
-    pub fn new<P: AsRef<Path>>(socket_path: P) -> std::io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(socket_path: P, filter: Option<Vec<String>>) -> std::io::Result<Self> {
         let socket = UnixDatagram::unbound()?;
         socket.connect(socket_path)?;
         socket.set_nonblocking(true)?;
-        Ok(Self { socket })
+        Ok(Self { socket, filter })
     }
 
     fn timestamp_ns() -> u128 {
@@ -113,6 +114,9 @@ impl SyscallTracer {
     }
 
     pub fn trace(&self, syscall: &'static str, args: SyscallArgs<'_>) {
+        if self.filter.as_ref().is_some_and(|filter| !filter.iter().any(|f| f == syscall)) {
+            return;
+        }
         let event = SyscallEvent {
             syscall,
             timestamp_ns: Self::timestamp_ns(),

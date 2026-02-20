@@ -71,6 +71,9 @@ enum Commands {
         allow_other: bool,
         #[arg(long)]
         trace_socket: Option<PathBuf>,
+        /// Comma-separated list of syscalls to trace (e.g. "read,open"). If omitted, all are traced.
+        #[arg(long)]
+        trace_filter: Option<String>,
     },
     Clean {
         #[arg(long)]
@@ -102,6 +105,7 @@ fn main() -> ExitCode {
             streaming,
             allow_other,
             trace_socket,
+            trace_filter,
         } => {
             init_logging(verbose);
 
@@ -163,9 +167,17 @@ fn main() -> ExitCode {
                 streaming,
             );
             let tracer = if let Some(socket_path) = trace_socket {
-                match SyscallTracer::new(&socket_path) {
+                let filter = trace_filter.map(|f| {
+                    f.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()
+                });
+                let filter_log = filter.as_ref().map(|f| f.join(","));
+                match SyscallTracer::new(&socket_path, filter) {
                     Ok(tracer) => {
-                        info!("syscall tracing enabled: {}", socket_path.display());
+                        if let Some(f) = filter_log {
+                            info!("syscall tracing enabled: {} (filter: {})", socket_path.display(), f);
+                        } else {
+                            info!("syscall tracing enabled: {}", socket_path.display());
+                        }
                         Some(tracer)
                     }
                     Err(err) => {
