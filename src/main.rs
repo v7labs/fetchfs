@@ -8,6 +8,7 @@ mod manifest;
 mod syscall_trace;
 mod tree;
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -167,10 +168,14 @@ fn main() -> ExitCode {
                 streaming,
             );
             let tracer = if let Some(socket_path) = trace_socket {
-                let filter = trace_filter.map(|f| {
-                    f.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()
+                let filter_log = trace_filter.as_ref().map(|f| {
+                    let mut v: Vec<_> = f.split(',').map(|s| s.trim()).collect();
+                    v.sort();
+                    v.join(",")
                 });
-                let filter_log = filter.as_ref().map(|f| f.join(","));
+                let filter = trace_filter.map(|f| {
+                    f.split(',').map(|s| s.trim().to_string()).collect::<HashSet<_>>()
+                });
                 match SyscallTracer::new(&socket_path, filter) {
                     Ok(tracer) => {
                         if let Some(f) = filter_log {

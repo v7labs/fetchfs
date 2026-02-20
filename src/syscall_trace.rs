@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,11 +96,11 @@ pub enum SyscallArgs<'a> {
 
 pub struct SyscallTracer {
     socket: UnixDatagram,
-    filter: Option<Vec<String>>,
+    filter: Option<HashSet<String>>,
 }
 
 impl SyscallTracer {
-    pub fn new<P: AsRef<Path>>(socket_path: P, filter: Option<Vec<String>>) -> std::io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(socket_path: P, filter: Option<HashSet<String>>) -> std::io::Result<Self> {
         let socket = UnixDatagram::unbound()?;
         socket.connect(socket_path)?;
         socket.set_nonblocking(true)?;
@@ -114,7 +115,7 @@ impl SyscallTracer {
     }
 
     pub fn trace(&self, syscall: &'static str, args: SyscallArgs<'_>) {
-        if self.filter.as_ref().is_some_and(|filter| !filter.iter().any(|f| f == syscall)) {
+        if self.filter.as_ref().is_some_and(|filter| !filter.contains(syscall)) {
             return;
         }
         let event = SyscallEvent {
