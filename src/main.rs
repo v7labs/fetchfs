@@ -8,6 +8,7 @@ mod manifest;
 mod syscall_trace;
 mod tree;
 
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,9 @@ enum Commands {
         allow_other: bool,
         #[arg(long)]
         trace_socket: Option<PathBuf>,
+        /// Comma-separated list of syscalls to trace (e.g. "read,open"). If omitted, all are traced.
+        #[arg(long)]
+        trace_filter: Option<String>,
     },
     Clean {
         #[arg(long)]
@@ -102,6 +106,7 @@ fn main() -> ExitCode {
             streaming,
             allow_other,
             trace_socket,
+            trace_filter,
         } => {
             init_logging(verbose);
 
@@ -163,9 +168,21 @@ fn main() -> ExitCode {
                 streaming,
             );
             let tracer = if let Some(socket_path) = trace_socket {
-                match SyscallTracer::new(&socket_path) {
+                let filter_log = trace_filter.as_ref().map(|f| {
+                    let mut v: Vec<_> = f.split(',').map(|s| s.trim()).collect();
+                    v.sort();
+                    v.join(",")
+                });
+                let filter = trace_filter.map(|f| {
+                    f.split(',').map(|s| s.trim().to_string()).collect::<HashSet<_>>()
+                });
+                match SyscallTracer::new(&socket_path, filter) {
                     Ok(tracer) => {
-                        info!("syscall tracing enabled: {}", socket_path.display());
+                        if let Some(f) = filter_log {
+                            info!("syscall tracing enabled: {} (filter: {})", socket_path.display(), f);
+                        } else {
+                            info!("syscall tracing enabled: {}", socket_path.display());
+                        }
                         Some(tracer)
                     }
                     Err(err) => {
