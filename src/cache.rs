@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::{env, io::ErrorKind};
 
@@ -17,6 +18,7 @@ use crate::http::UrlDownloader;
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
+    lru_tracker: Arc<LruTracker>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,79 @@ pub struct BlockCache {
 pub struct BlockEntry {
     pub dir: PathBuf,
     pub meta_path: PathBuf,
+}
+
+pub struct LruTracker {
+    inner: Mutex<LruInner>,
+    max_bytes: u64,
+}
+
+struct LruInner {
+    order: lru::LruCache<PathBuf, u64>,
+    current_bytes: u64,
+}
+
+impl std::fmt::Debug for LruTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LruTracker")
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LruTracker {
+    pub fn new(max_bytes: u64) -> Self {
+        LruTracker {
+            inner: Mutex::new(LruInner {
+                order: lru::LruCache::unbounded(),
+                current_bytes: 0,
+            }),
+            max_bytes,
+        }
+    }
+
+    /// Register a cached file. Evicts least-recently-used entries from disk
+    /// until total tracked bytes is within the configured limit.
+    pub fn track(&self, path: &Path, size: u64) {
+        let to_evict = {
+            let mut inner = self.inner.lock().expect("lru lock");
+            if let Some(old_size) = inner.order.get_mut(path) {
+                let prev = *old_size;
+                *old_size = size;
+                inner.current_bytes = inner.current_bytes - prev + size;
+                return;
+            }
+            inner.order.push(path.to_path_buf(), size);
+            inner.current_bytes += size;
+            let mut evicted = Vec::new();
+            while inner.current_bytes > self.max_bytes {
+                if let Some((p, s)) = inner.order.pop_lru() {
+                    inner.current_bytes -= s;
+                    evicted.push((p, s));
+                } else {
+                    break;
+                }
+            }
+            evicted
+        };
+        for (evicted_path, evicted_size) in to_evict {
+            if let Err(err) = fs::remove_file(&evicted_path) {
+                debug!("lru evict remove failed for {:?}: {err}", evicted_path);
+            }
+            info!("lru evicted {:?} ({evicted_size} bytes)", evicted_path);
+        }
+    }
+
+    /// Promote a cached file to most-recently-used.
+    pub fn touch(&self, path: &Path) {
+        let mut inner = self.inner.lock().expect("lru lock");
+        let _ = inner.order.get(path);
+    }
+
+    #[cfg(test)]
+    fn current_bytes(&self) -> u64 {
+        self.inner.lock().expect("lru lock").current_bytes
+    }
 }
 
 impl BlockCache {
@@ -95,8 +170,19 @@ impl BlockCache {
 }
 
 impl Cache {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Cache { root: root.into() }
+    pub fn new(root: impl Into<PathBuf>, lru_tracker: Arc<LruTracker>) -> Self {
+        Cache {
+            root: root.into(),
+            lru_tracker,
+        }
+    }
+
+    pub fn track(&self, path: &Path, size: u64) {
+        self.lru_tracker.track(path, size);
+    }
+
+    pub fn touch(&self, path: &Path) {
+        self.lru_tracker.touch(path);
     }
 
     pub fn entry_for(&self, url: &str) -> io::Result<CacheEntry> {
@@ -193,6 +279,7 @@ impl Cache {
         let _lock = Self::lock(entry)?;
         if Self::is_fresh(entry, expected)? {
             debug!("cache hit for {:?}", entry.data_path);
+            self.touch(&entry.data_path);
             return Ok(entry.data_path.clone());
         }
 
@@ -216,6 +303,7 @@ impl Cache {
             meta.size = Some(metadata.len());
         }
         Self::write_meta(entry, &meta)?;
+        self.track(&entry.data_path, meta.size.unwrap_or(0));
         Ok(entry.data_path.clone())
     }
 
@@ -223,16 +311,16 @@ impl Cache {
         &self,
         entry: &CacheEntry,
         expected: CacheMeta,
-        downloader: std::sync::Arc<D>,
-        download_gate: std::sync::Arc<DownloadGate>,
-        download_pool: std::sync::Arc<DownloadPool>,
+        downloader: Arc<D>,
+        download_gate: Arc<DownloadGate>,
+        download_pool: Arc<DownloadPool>,
     ) -> io::Result<PathBuf> {
         if Self::is_fresh(entry, &expected)? {
             debug!("cache hit for {:?}", entry.data_path);
+            self.touch(&entry.data_path);
             return Ok(entry.data_path.clone());
         }
 
-        // Create a placeholder so readers don't hit ENOENT while the background download starts.
         let _ = OpenOptions::new()
             .create(true)
             .append(true)
@@ -248,6 +336,7 @@ impl Cache {
 
         let data_path = entry.data_path.clone();
         let meta_path = entry.meta_path.clone();
+        let lru_tracker = Arc::clone(&self.lru_tracker);
         download_pool
             .enqueue(move || {
                 let _permit = download_gate.acquire();
@@ -259,11 +348,15 @@ impl Cache {
                     return;
                 }
                 let mut meta = expected;
-                if meta.size.is_none()
-                    && let Ok(metadata) = fs::metadata(&data_path)
-                {
-                    meta.size = Some(metadata.len());
-                }
+                let size = match meta.size {
+                    Some(s) => s,
+                    None => {
+                        let s = fs::metadata(&data_path).map(|m| m.len()).unwrap_or(0);
+                        meta.size = Some(s);
+                        s
+                    }
+                };
+                lru_tracker.track(&data_path, size);
                 if let Ok(raw) = serde_json::to_string(&meta) {
                     let _ = fs::write(&meta_path, raw);
                 }
@@ -291,6 +384,7 @@ impl Cache {
             meta.size = Some(data.len() as u64);
         }
         Self::write_meta(entry, &meta)?;
+        self.track(&entry.data_path, data.len() as u64);
         Ok(entry.data_path.clone())
     }
 
@@ -457,7 +551,7 @@ mod tests {
     #[test]
     fn cache_entry_paths_are_stable() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(tmp.path());
+        let cache = Cache::new(tmp.path(), Arc::new(LruTracker::new(u64::MAX)));
         let entry = cache
             .entry_for("https://example.com/file.txt")
             .expect("entry");
@@ -480,7 +574,7 @@ mod tests {
     #[test]
     fn ensure_cached_downloads_and_reuses() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(tmp.path());
+        let cache = Cache::new(tmp.path(), Arc::new(LruTracker::new(u64::MAX)));
         let entry = cache
             .entry_for("https://example.com/file.txt")
             .expect("entry");
@@ -506,5 +600,67 @@ mod tests {
         assert_eq!(second, entry.data_path);
         assert_eq!(*calls.lock().expect("lock"), 1);
         assert_eq!(fs::read(&entry.data_path).expect("read"), b"data");
+    }
+
+    #[test]
+    fn lru_tracker_evicts_oldest_when_over_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tracker = LruTracker::new(250);
+
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let path = tmp.path().join(format!("file_{i}"));
+            fs::write(&path, vec![0u8; 100]).expect("write");
+            paths.push(path);
+        }
+
+        for path in &paths {
+            tracker.track(path, 100);
+        }
+
+        assert!(!paths[0].exists(), "oldest file should be evicted");
+        assert!(paths[1].exists());
+        assert!(paths[2].exists());
+        assert_eq!(tracker.current_bytes(), 200);
+    }
+
+    #[test]
+    fn lru_tracker_touch_prevents_eviction() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tracker = LruTracker::new(250);
+
+        let path_a = tmp.path().join("a");
+        let path_b = tmp.path().join("b");
+        let path_c = tmp.path().join("c");
+        for p in [&path_a, &path_b, &path_c] {
+            fs::write(p, vec![0u8; 100]).expect("write");
+        }
+
+        tracker.track(&path_a, 100);
+        tracker.track(&path_b, 100);
+        tracker.touch(&path_a);
+        tracker.track(&path_c, 100);
+
+        assert!(path_a.exists(), "touched file should survive");
+        assert!(!path_b.exists(), "untouched LRU file should be evicted");
+        assert!(path_c.exists());
+        assert_eq!(tracker.current_bytes(), 200);
+    }
+
+    #[test]
+    fn lru_tracker_track_updates_existing_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tracker = LruTracker::new(500);
+
+        let path = tmp.path().join("file");
+        fs::write(&path, vec![0u8; 100]).expect("write");
+
+        tracker.track(&path, 100);
+        assert_eq!(tracker.current_bytes(), 100);
+
+        tracker.track(&path, 200);
+        assert_eq!(tracker.current_bytes(), 200);
+
+        assert!(path.exists());
     }
 }

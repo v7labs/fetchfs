@@ -100,7 +100,10 @@ pub struct SyscallTracer {
 }
 
 impl SyscallTracer {
-    pub fn new<P: AsRef<Path>>(socket_path: P, filter: Option<HashSet<String>>) -> std::io::Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        socket_path: P,
+        filter: Option<HashSet<String>>,
+    ) -> std::io::Result<Self> {
         let socket = UnixDatagram::unbound()?;
         socket.connect(socket_path)?;
         socket.set_nonblocking(true)?;
@@ -115,7 +118,11 @@ impl SyscallTracer {
     }
 
     pub fn trace(&self, syscall: &'static str, args: SyscallArgs<'_>) {
-        if self.filter.as_ref().is_some_and(|filter| !filter.contains(syscall)) {
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.contains(syscall))
+        {
             return;
         }
         let event = SyscallEvent {
@@ -129,7 +136,14 @@ impl SyscallTracer {
     }
 
     pub fn lookup(&self, parent: u64, name: &str, parent_path: Option<&str>) {
-        self.trace("lookup", SyscallArgs::Lookup { parent, name, parent_path });
+        self.trace(
+            "lookup",
+            SyscallArgs::Lookup {
+                parent,
+                name,
+                parent_path,
+            },
+        );
     }
 
     pub fn getattr(&self, ino: u64, fh: Option<u64>, path: Option<&str>) {
@@ -141,7 +155,15 @@ impl SyscallTracer {
     }
 
     pub fn getxattr(&self, ino: u64, name: &str, size: u32, path: Option<&str>) {
-        self.trace("getxattr", SyscallArgs::Getxattr { ino, name, size, path });
+        self.trace(
+            "getxattr",
+            SyscallArgs::Getxattr {
+                ino,
+                name,
+                size,
+                path,
+            },
+        );
     }
 
     pub fn listxattr(&self, ino: u64, size: u32, path: Option<&str>) {
@@ -149,7 +171,15 @@ impl SyscallTracer {
     }
 
     pub fn readdir(&self, ino: u64, fh: u64, offset: i64, path: Option<&str>) {
-        self.trace("readdir", SyscallArgs::Readdir { ino, fh, offset, path });
+        self.trace(
+            "readdir",
+            SyscallArgs::Readdir {
+                ino,
+                fh,
+                offset,
+                path,
+            },
+        );
     }
 
     pub fn open(&self, ino: u64, flags: i32, path: Option<&str>) {
@@ -157,18 +187,54 @@ impl SyscallTracer {
     }
 
     pub fn read(&self, ino: u64, fh: u64, offset: i64, size: u32, path: Option<&str>) {
-        self.trace("read", SyscallArgs::Read { ino, fh, offset, size, path });
+        self.trace(
+            "read",
+            SyscallArgs::Read {
+                ino,
+                fh,
+                offset,
+                size,
+                path,
+            },
+        );
     }
 
     pub fn release(&self, ino: u64, fh: u64, flags: i32, flush: bool, path: Option<&str>) {
-        self.trace("release", SyscallArgs::Release { ino, fh, flags, flush, path });
+        self.trace(
+            "release",
+            SyscallArgs::Release {
+                ino,
+                fh,
+                flags,
+                flush,
+                path,
+            },
+        );
     }
 
     pub fn flush(&self, ino: u64, fh: u64, lock_owner: u64, path: Option<&str>) {
-        self.trace("flush", SyscallArgs::Flush { ino, fh, lock_owner, path });
+        self.trace(
+            "flush",
+            SyscallArgs::Flush {
+                ino,
+                fh,
+                lock_owner,
+                path,
+            },
+        );
     }
 
     pub fn write(&self, ino: u64, fh: u64, offset: i64, size: u32, flags: i32, path: Option<&str>) {
-        self.trace("write", SyscallArgs::Write { ino, fh, offset, size, flags, path });
+        self.trace(
+            "write",
+            SyscallArgs::Write {
+                ino,
+                fh,
+                offset,
+                size,
+                flags,
+                path,
+            },
+        );
     }
 }
