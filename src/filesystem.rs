@@ -150,6 +150,7 @@ impl FetchFs {
         }
         let cache_entry = self.cache_entry_for(entry)?;
         if cache_entry.data_path.exists() {
+            self.cache.touch(&cache_entry.data_path);
             return read_from_path(&cache_entry.data_path, offset, size);
         }
 
@@ -241,6 +242,7 @@ impl FetchFs {
         for block in start_block..=end_block {
             let block_path = block_cache.block_path(&block_entry, block);
             if block_path.exists() {
+                self.cache.touch(&block_path);
                 continue;
             }
             {
@@ -256,6 +258,7 @@ impl FetchFs {
                     .open(&lock_path)?;
                 lock_file.lock_exclusive()?;
                 if block_path.exists() {
+                    self.cache.touch(&block_path);
                     drop(lock_file);
                     continue;
                 }
@@ -270,9 +273,11 @@ impl FetchFs {
                         if meta.mtime.is_none() {
                             meta.mtime = result.meta.mtime;
                         }
+                        let block_len = result.data.len() as u64;
                         let tmp_path = block_path.with_extension("tmp");
                         std::fs::write(&tmp_path, result.data)?;
                         std::fs::rename(&tmp_path, &block_path)?;
+                        self.cache.track(&block_path, block_len);
                         drop(lock_file);
                     }
                     RangeStatus::Full => {
@@ -361,7 +366,10 @@ mod tests {
         };
         let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(cache_dir.path());
+        let cache = Cache::new(
+            cache_dir.path(),
+            Arc::new(crate::cache::LruTracker::new(u64::MAX)),
+        );
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 100, 100).expect("client");
         let fs = FetchFs::new(
@@ -433,7 +441,10 @@ mod tests {
         };
         let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(cache_dir.path());
+        let cache = Cache::new(
+            cache_dir.path(),
+            Arc::new(crate::cache::LruTracker::new(u64::MAX)),
+        );
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
@@ -478,5 +489,205 @@ mod tests {
         let _ = server_thread.join();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn start_multi_file_server(
+        file_sizes: &[usize],
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        mpsc::Sender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+
+        let total_calls = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let total_calls_server = Arc::clone(&total_calls);
+
+        let bodies: Vec<Vec<u8>> = file_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &sz)| vec![b'a' + i as u8; sz])
+            .collect();
+        let n_files = bodies.len();
+
+        let handle = thread::spawn(move || {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(conn) => conn,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut buffer = [0u8; 4096];
+                let n = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..n]);
+                total_calls_server.fetch_add(1, Ordering::SeqCst);
+
+                let file_idx = request
+                    .lines()
+                    .next()
+                    .and_then(|line| {
+                        let path = line.split_whitespace().nth(1)?;
+                        let name = path.trim_start_matches('/');
+                        name.strip_prefix("file_")
+                            .and_then(|s| s.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0)
+                    .min(n_files.saturating_sub(1));
+
+                let body = &bodies[file_idx];
+                let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(body);
+            }
+        });
+
+        (addr, total_calls, stop_tx, handle)
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used_file() {
+        let (addr, total_calls, stop_tx, server_handle) = start_multi_file_server(&[100, 100, 100]);
+
+        let mtime = Some(chrono::Utc::now());
+        let manifest = Manifest {
+            version: 1,
+            entries: vec![
+                ManifestEntry {
+                    path: "file_0".to_string(),
+                    url: format!("http://{}/file_0", addr),
+                    size: Some(100),
+                    mtime,
+                },
+                ManifestEntry {
+                    path: "file_1".to_string(),
+                    url: format!("http://{}/file_1", addr),
+                    size: Some(100),
+                    mtime,
+                },
+                ManifestEntry {
+                    path: "file_2".to_string(),
+                    url: format!("http://{}/file_2", addr),
+                    size: Some(100),
+                    mtime,
+                },
+            ],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let tracker = Arc::new(crate::cache::LruTracker::new(250));
+        let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
+        let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
+        let fs = FetchFs::new(
+            manifest,
+            tree,
+            cache,
+            None,
+            Arc::new(downloader),
+            Arc::new(DownloadGate::new(4)),
+            Arc::new(DownloadPool::new(4)),
+            false,
+        );
+
+        for i in 0..3 {
+            fs.ensure_cached(&fs.manifest.entries[i]).expect("cache");
+        }
+
+        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        assert!(
+            !entry0.data_path.exists(),
+            "file_0 should be evicted (oldest)"
+        );
+        assert!(entry1.data_path.exists(), "file_1 should remain");
+        assert!(entry2.data_path.exists(), "file_2 should remain");
+        assert_eq!(total_calls.load(Ordering::SeqCst), 3);
+
+        fs.ensure_cached(&fs.manifest.entries[0]).expect("re-cache");
+        assert_eq!(
+            total_calls.load(Ordering::SeqCst),
+            4,
+            "evicted file should be re-downloaded"
+        );
+
+        let _ = stop_tx.send(());
+        let _ = server_handle.join();
+    }
+
+    #[test]
+    fn lru_touch_on_read_keeps_file_alive() {
+        let (addr, _total_calls, stop_tx, server_handle) =
+            start_multi_file_server(&[100, 100, 100]);
+
+        let mtime = Some(chrono::Utc::now());
+        let manifest = Manifest {
+            version: 1,
+            entries: vec![
+                ManifestEntry {
+                    path: "file_0".to_string(),
+                    url: format!("http://{}/file_0", addr),
+                    size: Some(100),
+                    mtime,
+                },
+                ManifestEntry {
+                    path: "file_1".to_string(),
+                    url: format!("http://{}/file_1", addr),
+                    size: Some(100),
+                    mtime,
+                },
+                ManifestEntry {
+                    path: "file_2".to_string(),
+                    url: format!("http://{}/file_2", addr),
+                    size: Some(100),
+                    mtime,
+                },
+            ],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let tracker = Arc::new(crate::cache::LruTracker::new(250));
+        let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
+        let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
+        let fs = FetchFs::new(
+            manifest,
+            tree,
+            cache,
+            None,
+            Arc::new(downloader),
+            Arc::new(DownloadGate::new(4)),
+            Arc::new(DownloadPool::new(4)),
+            false,
+        );
+
+        fs.ensure_cached(&fs.manifest.entries[0]).expect("cache A");
+        fs.ensure_cached(&fs.manifest.entries[1]).expect("cache B");
+
+        fs.read_range(&fs.manifest.entries[0], 0, 10)
+            .expect("touch A via read");
+
+        fs.ensure_cached(&fs.manifest.entries[2]).expect("cache C");
+
+        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        assert!(
+            entry0.data_path.exists(),
+            "file_0 should survive (was touched)"
+        );
+        assert!(!entry1.data_path.exists(), "file_1 should be evicted (LRU)");
+        assert!(entry2.data_path.exists(), "file_2 should remain");
+
+        let _ = stop_tx.send(());
+        let _ = server_handle.join();
     }
 }

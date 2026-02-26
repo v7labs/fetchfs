@@ -273,7 +273,12 @@ impl Filesystem for FuseFS {
         reply: ReplyXattr,
     ) {
         if let Some(tracer) = &self.tracer {
-            tracer.getxattr(ino, name.to_string_lossy().as_ref(), size, self.path_for_inode(ino));
+            tracer.getxattr(
+                ino,
+                name.to_string_lossy().as_ref(),
+                size,
+                self.path_for_inode(ino),
+            );
         }
         if self.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
@@ -433,14 +438,7 @@ impl Filesystem for FuseFS {
         reply.ok();
     }
 
-    fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
-        reply: ReplyEmpty,
-    ) {
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
         if let Some(tracer) = &self.tracer {
             tracer.flush(ino, fh, lock_owner, self.path_for_inode(ino));
         }
@@ -460,7 +458,14 @@ impl Filesystem for FuseFS {
         reply: ReplyWrite,
     ) {
         if let Some(tracer) = &self.tracer {
-            tracer.write(ino, fh, offset, data.len() as u32, flags, self.path_for_inode(ino));
+            tracer.write(
+                ino,
+                fh,
+                offset,
+                data.len() as u32,
+                flags,
+                self.path_for_inode(ino),
+            );
         }
         reply.error(EROFS);
     }
@@ -496,7 +501,10 @@ mod tests {
         };
         let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(cache_dir.path());
+        let cache = Cache::new(
+            cache_dir.path(),
+            std::sync::Arc::new(crate::cache::LruTracker::new(u64::MAX)),
+        );
         let http = HttpClient::new(0, 0, 100, 100).expect("client");
         let fs = FetchFs::new(
             manifest,

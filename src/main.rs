@@ -5,6 +5,7 @@ mod filesystem;
 mod fuse_fs;
 mod http;
 mod manifest;
+mod mount_cache;
 mod syscall_trace;
 mod tree;
 
@@ -19,7 +20,7 @@ use std::process::ExitCode;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cache::{Cache, default_cache_dir};
+use crate::cache::{Cache, LruTracker, default_cache_dir};
 use crate::download_gate::DownloadGate;
 use crate::download_pool::DownloadPool;
 use crate::filesystem::FetchFs;
@@ -60,8 +61,9 @@ enum Commands {
         connect_timeout_ms: u64,
         #[arg(long, default_value_t = 30000)]
         request_timeout_ms: u64,
-        #[arg(long)]
-        cache_max_bytes: Option<u64>,
+        /// Maximum cache size in bytes.
+        #[arg(long, default_value_t = 4_294_967_296)]
+        cache_max_bytes: u64,
         #[arg(long)]
         cache_max_age_days: Option<u64>,
         #[arg(long)]
@@ -136,15 +138,28 @@ fn main() -> ExitCode {
                 }
             };
             let file_count = manifest.entries.len();
-            let cache_dir = cache_dir.unwrap_or_else(|| {
-                default_cache_dir().unwrap_or_else(|_| PathBuf::from(".cache/fetchfs"))
-            });
-            let cache = Cache::new(cache_dir.clone());
-            if let Err(err) = cache.evict(cache_max_bytes, cache_max_age_days) {
+            let cache_base = match resolve_cache_dir(cache_dir) {
+                Some(dir) => dir,
+                None => return ExitCode::FAILURE,
+            };
+
+            mount_cache::cleanup_orphaned_mounts(&cache_base);
+
+            let instance_dir = match mount_cache::create_instance_dir(&cache_base) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    error!("failed to create instance cache dir: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let lru_tracker = Arc::new(LruTracker::new(cache_max_bytes));
+            let cache = Cache::new(instance_dir.clone(), lru_tracker);
+            if let Err(err) = cache.evict(None, cache_max_age_days) {
                 error!("failed to evict cache entries: {err}");
             }
             let block_cache = block_cache_size
-                .map(|size| crate::cache::BlockCache::new(cache_dir.join("blocks"), size));
+                .map(|size| crate::cache::BlockCache::new(instance_dir.join("blocks"), size));
             let downloader = match HttpClient::new(
                 retries,
                 retry_base_ms,
@@ -174,19 +189,28 @@ fn main() -> ExitCode {
                     v.join(",")
                 });
                 let filter = trace_filter.map(|f| {
-                    f.split(',').map(|s| s.trim().to_string()).collect::<HashSet<_>>()
+                    f.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<HashSet<_>>()
                 });
                 match SyscallTracer::new(&socket_path, filter) {
                     Ok(tracer) => {
                         if let Some(f) = filter_log {
-                            info!("syscall tracing enabled: {} (filter: {})", socket_path.display(), f);
+                            info!(
+                                "syscall tracing enabled: {} (filter: {})",
+                                socket_path.display(),
+                                f
+                            );
                         } else {
                             info!("syscall tracing enabled: {}", socket_path.display());
                         }
                         Some(tracer)
                     }
                     Err(err) => {
-                        error!("failed to create syscall tracer at {}: {err}", socket_path.display());
+                        error!(
+                            "failed to create syscall tracer at {}: {err}",
+                            socket_path.display()
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
@@ -200,25 +224,28 @@ fn main() -> ExitCode {
                 "ready to mount {} files at {} (cache: {})",
                 file_count,
                 mountpoint.display(),
-                cache_dir.display()
+                instance_dir.display()
             );
 
-            if let Err(err) = install_signal_handler(&mountpoint) {
+            if let Err(err) = install_signal_handler(&mountpoint, &instance_dir) {
                 error!("failed to install signal handler: {err}");
             }
 
             if let Err(err) = fuser::mount2(fuse_fs, &mountpoint, &mount_options) {
                 error!("failed to mount: {err}");
+                mount_cache::remove_instance_dir(&instance_dir);
                 return ExitCode::FAILURE;
             }
+            mount_cache::remove_instance_dir(&instance_dir);
             ExitCode::SUCCESS
         }
         Commands::Clean { cache_dir } => {
             init_logging(false);
-            let cache_dir = cache_dir.unwrap_or_else(|| {
-                default_cache_dir().unwrap_or_else(|_| PathBuf::from(".cache/fetchfs"))
-            });
-            let cache = Cache::new(cache_dir);
+            let cache_dir = match resolve_cache_dir(cache_dir) {
+                Some(dir) => dir,
+                None => return ExitCode::FAILURE,
+            };
+            let cache = Cache::new(cache_dir, Arc::new(LruTracker::new(u64::MAX)));
             if let Err(err) = cache.clean() {
                 error!("failed to clean cache: {err}");
                 ExitCode::FAILURE
@@ -229,10 +256,11 @@ fn main() -> ExitCode {
         }
         Commands::Stats { cache_dir } => {
             init_logging(false);
-            let cache_dir = cache_dir.unwrap_or_else(|| {
-                default_cache_dir().unwrap_or_else(|_| PathBuf::from(".cache/fetchfs"))
-            });
-            let cache = Cache::new(cache_dir.clone());
+            let cache_dir = match resolve_cache_dir(cache_dir) {
+                Some(dir) => dir,
+                None => return ExitCode::FAILURE,
+            };
+            let cache = Cache::new(cache_dir.clone(), Arc::new(LruTracker::new(u64::MAX)));
             match cache.stats() {
                 Ok(stats) => {
                     info!(
@@ -252,6 +280,19 @@ fn main() -> ExitCode {
     }
 }
 
+fn resolve_cache_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = explicit {
+        return Some(dir);
+    }
+    match default_cache_dir() {
+        Ok(dir) => Some(dir),
+        Err(err) => {
+            error!("cannot determine cache directory: {err}");
+            None
+        }
+    }
+}
+
 fn init_logging(verbose: bool) {
     let filter = if verbose {
         EnvFilter::new("debug")
@@ -264,16 +305,19 @@ fn init_logging(verbose: bool) {
         .try_init();
 }
 
-fn install_signal_handler(mountpoint: &Path) -> Result<(), std::io::Error> {
+fn install_signal_handler(mountpoint: &Path, instance_dir: &Path) -> Result<(), std::io::Error> {
     use signal_hook::consts::signal::{SIGINT, SIGTERM};
     let mut signals = signal_hook::iterator::Signals::new([SIGINT, SIGTERM])?;
     let mountpoint = mountpoint.to_path_buf();
+    let instance_dir = instance_dir.to_path_buf();
     std::thread::spawn(move || {
-        if let Some(_signal) = signals.forever().next()
-            && let Err(err) = unmount_fs(&mountpoint)
-            && err.kind() != std::io::ErrorKind::InvalidInput
-        {
-            warn!("unmount failed: {err}");
+        if let Some(_signal) = signals.forever().next() {
+            if let Err(err) = unmount_fs(&mountpoint)
+                && err.kind() != std::io::ErrorKind::InvalidInput
+            {
+                warn!("unmount failed: {err}");
+            }
+            mount_cache::remove_instance_dir(&instance_dir);
         }
     });
     Ok(())
