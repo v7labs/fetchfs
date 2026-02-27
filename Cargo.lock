@@ -291,6 +291,7 @@ name = "fetchfs"
 version = "0.2.1"
 dependencies = [
  "arc-swap",
+ "base64",
  "chrono",
  "clap",
  "fs2",
