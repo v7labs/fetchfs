@@ -15,16 +15,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cache::{Cache, LruTracker, default_cache_dir};
 use crate::download_gate::DownloadGate;
 use crate::download_pool::DownloadPool;
 use crate::filesystem::FetchFs;
-use crate::fuse_fs::FuseFS;
+use crate::fuse_fs::{FuseFS, MountState};
 use crate::http::HttpClient;
 use crate::manifest::Manifest;
 use crate::syscall_trace::SyscallTracer;
@@ -123,7 +124,8 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            let manifest = match Manifest::load_from_path(&manifest) {
+            let manifest_path = manifest;
+            let manifest = match Manifest::load_from_path(&manifest_path) {
                 Ok(manifest) => manifest,
                 Err(err) => {
                     error!("failed to load manifest: {err}");
@@ -138,6 +140,8 @@ fn main() -> ExitCode {
                 }
             };
             let file_count = manifest.entries.len();
+            let state = Arc::new(ArcSwap::from_pointee(MountState::build(manifest, tree, 0)));
+
             let cache_base = match resolve_cache_dir(cache_dir) {
                 Some(dir) => dir,
                 None => return ExitCode::FAILURE,
@@ -173,8 +177,6 @@ fn main() -> ExitCode {
                 }
             };
             let fs = FetchFs::new(
-                manifest,
-                tree,
                 cache,
                 block_cache,
                 Arc::new(downloader),
@@ -217,7 +219,7 @@ fn main() -> ExitCode {
             } else {
                 None
             };
-            let fuse_fs = FuseFS::new(fs, tracer);
+            let fuse_fs = FuseFS::new(fs, Arc::clone(&state), tracer);
             let mount_options = FuseFS::mount_options(allow_other);
 
             info!(
@@ -230,6 +232,8 @@ fn main() -> ExitCode {
             if let Err(err) = install_signal_handler(&mountpoint, &instance_dir) {
                 error!("failed to install signal handler: {err}");
             }
+
+            let _watcher = start_manifest_watcher(&manifest_path, state);
 
             if let Err(err) = fuser::mount2(fuse_fs, &mountpoint, &mount_options) {
                 error!("failed to mount: {err}");
@@ -303,6 +307,73 @@ fn init_logging(verbose: bool) {
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+fn start_manifest_watcher(
+    path: &Path,
+    state: Arc<ArcSwap<MountState>>,
+) -> Option<notify::RecommendedWatcher> {
+    use notify::{RecursiveMode, Watcher};
+
+    let reload_path = path.to_path_buf();
+    let mut watcher = match notify::recommended_watcher(
+        move |res: Result<notify::Event, notify::Error>| match res {
+            Ok(event)
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) =>
+            {
+                reload_manifest(&reload_path, &state);
+            }
+            Err(err) => warn!("manifest watch error: {err}"),
+            _ => {}
+        },
+    ) {
+        Ok(w) => w,
+        Err(err) => {
+            warn!("manifest watching disabled: {err}");
+            return None;
+        }
+    };
+    if let Err(err) = watcher.watch(path, RecursiveMode::NonRecursive) {
+        warn!("failed to watch manifest file: {err}");
+        return None;
+    }
+    info!("manifest watching enabled: {}", path.display());
+    Some(watcher)
+}
+
+fn reload_manifest(path: &Path, state: &ArcSwap<MountState>) {
+    let new_manifest = match Manifest::load_from_path(path) {
+        Ok(m) => m,
+        Err(err) => {
+            warn!("failed to reload manifest: {err}");
+            return;
+        }
+    };
+    let current = state.load();
+    if new_manifest.revision == current.manifest.revision {
+        debug!(
+            "manifest revision unchanged ({}), skipping reload",
+            new_manifest.revision
+        );
+        return;
+    }
+    match new_manifest.build_tree() {
+        Ok(new_tree) => {
+            let file_count = new_manifest.entries.len();
+            let revision = &new_manifest.revision;
+            info!("manifest reloaded: revision={revision}, {file_count} files");
+            let next_gen = current.generation + 1;
+            state.store(Arc::new(MountState::build(
+                new_manifest,
+                new_tree,
+                next_gen,
+            )));
+        }
+        Err(err) => warn!("failed to rebuild tree on manifest reload: {err}"),
+    }
 }
 
 fn install_signal_handler(mountpoint: &Path, instance_dir: &Path) -> Result<(), std::io::Error> {
