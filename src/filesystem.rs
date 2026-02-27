@@ -1,5 +1,5 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -11,12 +11,9 @@ use crate::cache::{BlockCache, BlockMeta, Cache, CacheEntry, CacheMeta};
 use crate::download_gate::DownloadGate;
 use crate::download_pool::DownloadPool;
 use crate::http::{HttpClient, RangeStatus};
-use crate::manifest::{Manifest, ManifestEntry};
-use crate::tree::{DirEntry, PathTree};
+use crate::manifest::ManifestEntry;
 
 pub struct FetchFs {
-    pub manifest: Manifest,
-    pub tree: PathTree,
     pub cache: Cache,
     pub block_cache: Option<BlockCache>,
     pub downloader: Arc<HttpClient>,
@@ -29,8 +26,6 @@ pub struct FetchFs {
 impl FetchFs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        manifest: Manifest,
-        tree: PathTree,
         cache: Cache,
         block_cache: Option<BlockCache>,
         downloader: Arc<HttpClient>,
@@ -39,8 +34,6 @@ impl FetchFs {
         streaming: bool,
     ) -> Self {
         Self {
-            manifest,
-            tree,
             cache,
             block_cache,
             downloader,
@@ -51,23 +44,28 @@ impl FetchFs {
         }
     }
 
-    pub fn list_dir(&self, path: &str) -> Option<Vec<DirEntry>> {
-        self.tree.list_dir(path)
+    pub(crate) fn cache_entry_for(&self, entry: &ManifestEntry) -> std::io::Result<CacheEntry> {
+        self.cache.entry_for(entry.require_url()?)
     }
 
-    pub fn cache_entry_for(&self, entry: &ManifestEntry) -> std::io::Result<CacheEntry> {
-        self.cache.entry_for(&entry.url)
-    }
-
-    pub fn cache_meta_for(&self, entry: &ManifestEntry) -> CacheMeta {
+    fn cache_meta_for(&self, entry: &ManifestEntry) -> CacheMeta {
         CacheMeta {
-            url: entry.url.clone(),
+            url: entry.url().unwrap_or("").to_string(),
             size: entry.size,
             mtime: entry.mtime,
         }
     }
 
     pub fn ensure_meta(&self, entry: &ManifestEntry) -> Option<CacheMeta> {
+        if let Some(data) = entry.inline_data() {
+            return Some(CacheMeta {
+                url: String::new(),
+                size: Some(data.len() as u64),
+                mtime: entry.mtime,
+            });
+        }
+
+        let url = entry.url()?;
         let cache_entry = self.cache_entry_for(entry).ok()?;
         if cache_entry.meta_path.exists() {
             return Cache::load_meta(&cache_entry).ok();
@@ -77,9 +75,9 @@ impl FetchFs {
             let _ = Cache::write_meta(&cache_entry, &meta);
             return Some(meta);
         }
-        debug!("fetching metadata for {}", entry.url);
+        debug!("fetching metadata for {}", url);
         let _permit = self.download_gate.acquire();
-        if let Ok(head) = self.downloader.head_with_fallback(&entry.url) {
+        if let Ok(head) = self.downloader.head_with_fallback(url) {
             if meta.size.is_none() {
                 meta.size = head.size;
             }
@@ -87,20 +85,21 @@ impl FetchFs {
                 meta.mtime = head.mtime;
             }
             if Cache::write_meta(&cache_entry, &meta).is_ok() {
-                debug!("cached metadata for {}", entry.url);
+                debug!("cached metadata for {}", url);
                 return Some(meta);
             }
         }
-        debug!("metadata unavailable for {}", entry.url);
+        debug!("metadata unavailable for {}", url);
         None
     }
 
     pub fn ensure_cached(&self, entry: &ManifestEntry) -> std::io::Result<(CacheEntry, PathBuf)> {
+        let url = entry.require_url()?;
         let cache_entry = self.cache_entry_for(entry)?;
         let mut meta = self.cache_meta_for(entry);
         if meta.size.is_none() || meta.mtime.is_none() {
             let _permit = self.download_gate.acquire();
-            if let Ok(head) = self.downloader.head_with_fallback(&entry.url) {
+            if let Ok(head) = self.downloader.head_with_fallback(url) {
                 if meta.size.is_none() {
                     meta.size = head.size;
                 }
@@ -134,12 +133,15 @@ impl FetchFs {
         if size == 0 {
             return Ok(Vec::new());
         }
+        if let Some(data) = entry.inline_data() {
+            return Ok(read_from_slice(data, offset, size));
+        }
         if let Some(block_cache) = &self.block_cache {
             return self.read_range_block_cache(entry, offset, size, block_cache);
         }
         if !self.streaming && offset == 0 {
             let known_size = entry
-                .size
+                .known_size()
                 .or_else(|| self.ensure_meta(entry).and_then(|meta| meta.size));
             if let Some(total) = known_size
                 && (size as u64) >= total
@@ -154,9 +156,10 @@ impl FetchFs {
             return read_from_path(&cache_entry.data_path, offset, size);
         }
 
+        let url = entry.require_url()?;
         let _permit = self.download_gate.acquire();
         let end = offset.saturating_add(size as u64).saturating_sub(1);
-        let result = self.downloader.get_range(&entry.url, offset, end)?;
+        let result = self.downloader.get_range(url, offset, end)?;
         let mut meta = self.cache_meta_for(entry);
         if meta.size.is_none() {
             meta.size = result.meta.size;
@@ -208,27 +211,25 @@ impl FetchFs {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let block_entry = block_cache.entry_for(&entry.url)?;
-        let mut meta = if block_entry.meta_path.exists() {
-            BlockCache::load_meta(&block_entry)?
-        } else {
-            BlockMeta {
-                url: entry.url.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                block_size: block_cache.block_size(),
-                no_range: false,
-            }
+        let url = entry.require_url()?;
+        let fresh_meta = || BlockMeta {
+            url: url.to_string(),
+            size: entry.size,
+            mtime: entry.mtime,
+            block_size: block_cache.block_size(),
+            no_range: false,
         };
-        if meta.url != entry.url || meta.block_size != block_cache.block_size() {
-            meta = BlockMeta {
-                url: entry.url.clone(),
-                size: entry.size,
-                mtime: entry.mtime,
-                block_size: block_cache.block_size(),
-                no_range: false,
-            };
-        }
+        let block_entry = block_cache.entry_for(url)?;
+        let mut meta = if block_entry.meta_path.exists() {
+            let loaded = BlockCache::load_meta(&block_entry)?;
+            if loaded.url != url || loaded.block_size != block_cache.block_size() {
+                fresh_meta()
+            } else {
+                loaded
+            }
+        } else {
+            fresh_meta()
+        };
 
         if meta.no_range {
             let (_entry, data_path) = self.ensure_cached(entry)?;
@@ -264,7 +265,7 @@ impl FetchFs {
                 }
                 let start = block * block_size;
                 let end = start + block_size - 1;
-                let result = self.downloader.get_range(&entry.url, start, end)?;
+                let result = self.downloader.get_range(url, start, end)?;
                 match result.status {
                     RangeStatus::Partial => {
                         if meta.size.is_none() {
@@ -334,7 +335,16 @@ pub(crate) fn system_time_from_datetime(dt: DateTime<Utc>) -> SystemTime {
         + std::time::Duration::from_nanos(nanos)
 }
 
-fn read_from_path(path: &PathBuf, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
+fn read_from_slice(data: &[u8], offset: u64, size: u32) -> Vec<u8> {
+    let off = offset as usize;
+    if off >= data.len() {
+        return Vec::new();
+    }
+    let end = (off + size as usize).min(data.len());
+    data[off..end].to_vec()
+}
+
+fn read_from_path(path: &Path, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; size as usize];
@@ -346,6 +356,7 @@ fn read_from_path(path: &PathBuf, offset: u64, size: u32) -> std::io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -357,14 +368,13 @@ mod tests {
     fn read_range_zero_size_returns_empty() {
         let manifest = Manifest {
             version: 1,
-            entries: vec![ManifestEntry {
-                path: "data/file.txt".to_string(),
-                url: "http://127.0.0.1:1".to_string(),
-                size: Some(10),
-                mtime: None,
-            }],
+            revision: String::new(),
+            entries: vec![ManifestEntry::test_remote(
+                "data/file.txt",
+                "http://127.0.0.1:1",
+                Some(10),
+            )],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::new(
             cache_dir.path(),
@@ -373,8 +383,6 @@ mod tests {
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 100, 100).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             block_cache,
             Arc::new(downloader),
@@ -383,9 +391,55 @@ mod tests {
             false,
         );
 
-        let entry = fs.manifest.entries.first().expect("entry");
+        let entry = manifest.entries.first().expect("entry");
         let data = fs.read_range(entry, 0, 0).expect("read");
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn read_range_inline_returns_data() {
+        let inline = ManifestEntry::test_inline("hello.txt", b"Hello, world!");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::new(
+            cache_dir.path(),
+            Arc::new(crate::cache::LruTracker::new(u64::MAX)),
+        );
+        let downloader = HttpClient::new(0, 0, 100, 100).expect("client");
+        let fs = FetchFs::new(
+            cache,
+            None,
+            Arc::new(downloader),
+            Arc::new(DownloadGate::new(1)),
+            Arc::new(crate::download_pool::DownloadPool::new(1)),
+            false,
+        );
+
+        assert_eq!(fs.read_range(&inline, 0, 100).unwrap(), b"Hello, world!");
+        assert_eq!(fs.read_range(&inline, 7, 5).unwrap(), b"world");
+        assert_eq!(fs.read_range(&inline, 100, 10).unwrap(), b"");
+        assert_eq!(fs.read_range(&inline, 0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn ensure_meta_inline_returns_size() {
+        let inline = ManifestEntry::test_inline("f.txt", b"abcdef");
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache = Cache::new(
+            cache_dir.path(),
+            Arc::new(crate::cache::LruTracker::new(u64::MAX)),
+        );
+        let downloader = HttpClient::new(0, 0, 100, 100).expect("client");
+        let fs = FetchFs::new(
+            cache,
+            None,
+            Arc::new(downloader),
+            Arc::new(DownloadGate::new(1)),
+            Arc::new(crate::download_pool::DownloadPool::new(1)),
+            false,
+        );
+
+        let meta = fs.ensure_meta(&inline).expect("meta");
+        assert_eq!(meta.size, Some(6));
     }
 
     #[test]
@@ -430,16 +484,12 @@ mod tests {
             }
         });
 
+        let url = format!("http://{}", addr);
         let manifest = Manifest {
             version: 1,
-            entries: vec![ManifestEntry {
-                path: "data/file.txt".to_string(),
-                url: format!("http://{}", addr),
-                size: None,
-                mtime: None,
-            }],
+            revision: String::new(),
+            entries: vec![ManifestEntry::test_remote("data/file.txt", &url, None)],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::new(
             cache_dir.path(),
@@ -448,8 +498,6 @@ mod tests {
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             block_cache,
             Arc::new(downloader),
@@ -460,7 +508,7 @@ mod tests {
         let fs = Arc::new(fs);
         let fs_first = Arc::clone(&fs);
         let fs_second = Arc::clone(&fs);
-        let entry = fs.manifest.entries[0].clone();
+        let entry = manifest.entries[0].clone();
         let entry_first = entry.clone();
         let entry_second = entry.clone();
 
@@ -561,35 +609,33 @@ mod tests {
         let mtime = Some(chrono::Utc::now());
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![
-                ManifestEntry {
-                    path: "file_0".to_string(),
-                    url: format!("http://{}/file_0", addr),
-                    size: Some(100),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_0",
+                    &format!("http://{}/file_0", addr),
+                    Some(100),
                     mtime,
-                },
-                ManifestEntry {
-                    path: "file_1".to_string(),
-                    url: format!("http://{}/file_1", addr),
-                    size: Some(100),
+                ),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_1",
+                    &format!("http://{}/file_1", addr),
+                    Some(100),
                     mtime,
-                },
-                ManifestEntry {
-                    path: "file_2".to_string(),
-                    url: format!("http://{}/file_2", addr),
-                    size: Some(100),
+                ),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_2",
+                    &format!("http://{}/file_2", addr),
+                    Some(100),
                     mtime,
-                },
+                ),
             ],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let tracker = Arc::new(crate::cache::LruTracker::new(250));
         let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             None,
             Arc::new(downloader),
@@ -599,12 +645,12 @@ mod tests {
         );
 
         for i in 0..3 {
-            fs.ensure_cached(&fs.manifest.entries[i]).expect("cache");
+            fs.ensure_cached(&manifest.entries[i]).expect("cache");
         }
 
-        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
-        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
-        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        let entry0 = fs.cache_entry_for(&manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&manifest.entries[2]).expect("entry");
         assert!(
             !entry0.data_path.exists(),
             "file_0 should be evicted (oldest)"
@@ -613,7 +659,7 @@ mod tests {
         assert!(entry2.data_path.exists(), "file_2 should remain");
         assert_eq!(total_calls.load(Ordering::SeqCst), 3);
 
-        fs.ensure_cached(&fs.manifest.entries[0]).expect("re-cache");
+        fs.ensure_cached(&manifest.entries[0]).expect("re-cache");
         assert_eq!(
             total_calls.load(Ordering::SeqCst),
             4,
@@ -632,35 +678,33 @@ mod tests {
         let mtime = Some(chrono::Utc::now());
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![
-                ManifestEntry {
-                    path: "file_0".to_string(),
-                    url: format!("http://{}/file_0", addr),
-                    size: Some(100),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_0",
+                    &format!("http://{}/file_0", addr),
+                    Some(100),
                     mtime,
-                },
-                ManifestEntry {
-                    path: "file_1".to_string(),
-                    url: format!("http://{}/file_1", addr),
-                    size: Some(100),
+                ),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_1",
+                    &format!("http://{}/file_1", addr),
+                    Some(100),
                     mtime,
-                },
-                ManifestEntry {
-                    path: "file_2".to_string(),
-                    url: format!("http://{}/file_2", addr),
-                    size: Some(100),
+                ),
+                ManifestEntry::test_remote_with_mtime(
+                    "file_2",
+                    &format!("http://{}/file_2", addr),
+                    Some(100),
                     mtime,
-                },
+                ),
             ],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let tracker = Arc::new(crate::cache::LruTracker::new(250));
         let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             None,
             Arc::new(downloader),
@@ -669,17 +713,17 @@ mod tests {
             false,
         );
 
-        fs.ensure_cached(&fs.manifest.entries[0]).expect("cache A");
-        fs.ensure_cached(&fs.manifest.entries[1]).expect("cache B");
+        fs.ensure_cached(&manifest.entries[0]).expect("cache A");
+        fs.ensure_cached(&manifest.entries[1]).expect("cache B");
 
-        fs.read_range(&fs.manifest.entries[0], 0, 10)
+        fs.read_range(&manifest.entries[0], 0, 10)
             .expect("touch A via read");
 
-        fs.ensure_cached(&fs.manifest.entries[2]).expect("cache C");
+        fs.ensure_cached(&manifest.entries[2]).expect("cache C");
 
-        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
-        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
-        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        let entry0 = fs.cache_entry_for(&manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&manifest.entries[2]).expect("entry");
         assert!(
             entry0.data_path.exists(),
             "file_0 should survive (was touched)"

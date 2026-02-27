@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use arc_swap::ArcSwap;
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
@@ -11,15 +12,19 @@ use fuser::{
 use libc::{EIO, ENOENT, EROFS};
 
 use crate::filesystem::FetchFs;
-use crate::manifest::ManifestEntry;
+use crate::manifest::{Manifest, ManifestEntry};
 use crate::syscall_trace::SyscallTracer;
+use crate::tree::PathTree;
 
-// Keep attrs fresh while files are fetched lazily.
 const TTL: Duration = Duration::from_secs(1);
 #[cfg(target_os = "macos")]
 const NO_XATTR: i32 = libc::ENOATTR;
 #[cfg(not(target_os = "macos"))]
 const NO_XATTR: i32 = libc::ENOTSUP;
+
+const ROOT_INO: u64 = fuser::FUSE_ROOT_ID;
+const FETCHFS_JSON_INO: u64 = u64::MAX;
+const FETCHFS_JSON_NAME: &str = ".fetchfs.json";
 
 #[derive(Debug, Clone)]
 struct NodeInfo {
@@ -28,24 +33,23 @@ struct NodeInfo {
     entry_index: Option<usize>,
 }
 
-pub struct FuseFS {
-    fs: FetchFs,
+pub struct MountState {
+    pub manifest: Manifest,
+    pub tree: PathTree,
     path_to_inode: HashMap<String, u64>,
     inode_to_node: HashMap<u64, NodeInfo>,
-    handles: Mutex<HashMap<u64, usize>>,
-    next_fh: AtomicU64,
-    tracer: Option<SyscallTracer>,
+    fetchfs_json_content: Vec<u8>,
 }
 
-impl FuseFS {
-    pub fn new(fs: FetchFs, tracer: Option<SyscallTracer>) -> Self {
+impl MountState {
+    pub fn build(manifest: Manifest, tree: PathTree) -> Self {
         let mut path_to_inode = HashMap::new();
         let mut inode_to_node = HashMap::new();
         let mut next_inode = 2u64;
 
-        path_to_inode.insert(String::new(), 1);
+        path_to_inode.insert(String::new(), ROOT_INO);
         inode_to_node.insert(
-            1,
+            ROOT_INO,
             NodeInfo {
                 path: String::new(),
                 kind: FileType::Directory,
@@ -53,19 +57,16 @@ impl FuseFS {
             },
         );
 
-        let mut dir_paths = Vec::new();
-        for (idx, entry) in fs.manifest.entries.iter().enumerate() {
+        let mut dir_paths = BTreeSet::new();
+        for (idx, entry) in manifest.entries.iter().enumerate() {
+            let segments: Vec<_> = entry.path.split('/').collect();
             let mut current = String::new();
-            for segment in entry
-                .path
-                .split('/')
-                .take(entry.path.split('/').count() - 1)
-            {
+            for &segment in &segments[..segments.len().saturating_sub(1)] {
                 if !current.is_empty() {
                     current.push('/');
                 }
                 current.push_str(segment);
-                dir_paths.push(current.clone());
+                dir_paths.insert(current.clone());
             }
             path_to_inode.insert(entry.path.clone(), next_inode);
             inode_to_node.insert(
@@ -79,8 +80,6 @@ impl FuseFS {
             next_inode += 1;
         }
 
-        dir_paths.sort();
-        dir_paths.dedup();
         for path in dir_paths {
             if path_to_inode.contains_key(&path) {
                 continue;
@@ -97,13 +96,60 @@ impl FuseFS {
             next_inode += 1;
         }
 
+        let fetchfs_json_content = build_fetchfs_json(manifest.version, &manifest.revision);
+
         Self {
-            fs,
+            manifest,
+            tree,
             path_to_inode,
             inode_to_node,
+            fetchfs_json_content,
+        }
+    }
+
+    fn inode_for_path(&self, path: &str) -> Option<u64> {
+        self.path_to_inode.get(path).copied()
+    }
+
+    fn node_for_inode(&self, inode: u64) -> Option<&NodeInfo> {
+        self.inode_to_node.get(&inode)
+    }
+
+    fn path_for_inode(&self, inode: u64) -> Option<&str> {
+        self.inode_to_node.get(&inode).map(|n| n.path.as_str())
+    }
+}
+
+fn build_fetchfs_json(version: u32, revision: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"version": version, "revision": revision})).unwrap()
+}
+
+pub struct FuseFS {
+    fs: FetchFs,
+    state: Arc<ArcSwap<MountState>>,
+    handles: Mutex<HashMap<u64, Option<ManifestEntry>>>,
+    next_fh: AtomicU64,
+    tracer: Option<SyscallTracer>,
+    uid: u32,
+    gid: u32,
+}
+
+impl FuseFS {
+    pub fn new(
+        fs: FetchFs,
+        state: Arc<ArcSwap<MountState>>,
+        tracer: Option<SyscallTracer>,
+    ) -> Self {
+        // SAFETY: geteuid/getegid are side-effect-free and do not violate memory safety.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Self {
+            fs,
+            state,
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             tracer,
+            uid,
+            gid,
         }
     }
 
@@ -119,44 +165,17 @@ impl FuseFS {
         options
     }
 
-    fn inode_for_path(&self, path: &str) -> Option<u64> {
-        self.path_to_inode.get(path).copied()
-    }
-
-    fn node_for_inode(&self, inode: u64) -> Option<&NodeInfo> {
-        self.inode_to_node.get(&inode)
-    }
-
-    fn path_for_inode(&self, inode: u64) -> Option<&str> {
-        self.inode_to_node.get(&inode).map(|n| n.path.as_str())
-    }
-
-    fn file_attr(&self, inode: u64, entry: Option<&ManifestEntry>) -> FileAttr {
-        let kind = entry
-            .map(|_| FileType::RegularFile)
-            .unwrap_or(FileType::Directory);
-        let meta = entry.and_then(|entry| self.fs.ensure_meta(entry));
-        let size = if let Some(entry) = entry {
-            if let Some(cached) = self.cached_size(entry) {
-                cached
-            } else {
-                meta.as_ref()
-                    .and_then(|meta| meta.size)
-                    .or(entry.size)
-                    .unwrap_or(0)
-            }
+    fn resolve_path_for_trace<'a>(&self, ino: u64, state: &'a MountState) -> Option<&'a str> {
+        if ino == FETCHFS_JSON_INO {
+            Some(FETCHFS_JSON_NAME)
         } else {
-            0
-        };
-        let mtime = if let Some(entry) = entry {
-            meta.and_then(|meta| meta.mtime)
-                .map(crate::filesystem::system_time_from_datetime)
-                .unwrap_or_else(|| self.fs.mtime_for(entry))
-        } else {
-            self.fs.mount_system_time()
-        };
+            state.path_for_inode(ino)
+        }
+    }
+
+    fn make_attr(&self, ino: u64, kind: FileType, size: u64, mtime: SystemTime) -> FileAttr {
         FileAttr {
-            ino: inode,
+            ino,
             size,
             blocks: 1,
             atime: SystemTime::UNIX_EPOCH,
@@ -170,17 +189,50 @@ impl FuseFS {
                 0o444
             },
             nlink: 1,
-            // SAFETY: libc::geteuid/getegid are side-effect-free and do not violate memory safety.
-            uid: unsafe { libc::geteuid() },
-            // SAFETY: libc::geteuid/getegid are side-effect-free and do not violate memory safety.
-            gid: unsafe { libc::getegid() },
+            uid: self.uid,
+            gid: self.gid,
             rdev: 0,
             flags: 0,
             blksize: 512,
         }
     }
 
+    fn file_attr(&self, inode: u64, entry: Option<&ManifestEntry>) -> FileAttr {
+        let kind = entry
+            .map(|_| FileType::RegularFile)
+            .unwrap_or(FileType::Directory);
+        let meta = entry.and_then(|e| self.fs.ensure_meta(e));
+        let size = entry
+            .map(|e| {
+                self.cached_size(e)
+                    .or_else(|| meta.as_ref().and_then(|m| m.size))
+                    .or(e.size)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let mtime = entry
+            .map(|e| {
+                meta.and_then(|m| m.mtime)
+                    .map(crate::filesystem::system_time_from_datetime)
+                    .unwrap_or_else(|| self.fs.mtime_for(e))
+            })
+            .unwrap_or_else(|| self.fs.mount_system_time());
+        self.make_attr(inode, kind, size, mtime)
+    }
+
+    fn fetchfs_json_attr(&self, state: &MountState) -> FileAttr {
+        self.make_attr(
+            FETCHFS_JSON_INO,
+            FileType::RegularFile,
+            state.fetchfs_json_content.len() as u64,
+            self.fs.mount_system_time(),
+        )
+    }
+
     fn cached_size(&self, entry: &ManifestEntry) -> Option<u64> {
+        if let Some(data) = entry.inline_data() {
+            return Some(data.len() as u64);
+        }
         let cache_entry = self.fs.cache_entry_for(entry).ok()?;
         if !cache_entry.data_path.exists() {
             return None;
@@ -193,49 +245,61 @@ impl FuseFS {
 
 impl Filesystem for FuseFS {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            let parent_path = self.path_for_inode(parent);
+            let parent_path = state.path_for_inode(parent);
             tracer.lookup(parent, name.to_string_lossy().as_ref(), parent_path);
         }
-        let parent_node = match self.node_for_inode(parent) {
+        let parent_node = match state.node_for_inode(parent) {
             Some(node) => node,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        let name = match name.to_str() {
+        let name_str = match name.to_str() {
             Some(name) => name,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
+        if parent == ROOT_INO && name_str == FETCHFS_JSON_NAME {
+            let attr = self.fetchfs_json_attr(&state);
+            reply.entry(&TTL, &attr, 0);
+            return;
+        }
         let path = if parent_node.path.is_empty() {
-            name.to_string()
+            name_str.to_string()
         } else {
-            format!("{}/{}", parent_node.path, name)
+            format!("{}/{}", parent_node.path, name_str)
         };
-        let inode = match self.inode_for_path(&path) {
+        let inode = match state.inode_for_path(&path) {
             Some(inode) => inode,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        let node = self.node_for_inode(inode).expect("inode exists");
+        let node = state.node_for_inode(inode).expect("inode exists");
         let entry = node
             .entry_index
-            .and_then(|idx| self.fs.manifest.entries.get(idx));
+            .and_then(|idx| state.manifest.entries.get(idx));
         let attr = self.file_attr(inode, entry);
         reply.entry(&TTL, &attr, 0);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.getattr(ino, fh, self.path_for_inode(ino));
+            tracer.getattr(ino, fh, self.resolve_path_for_trace(ino, &state));
         }
-        let node = match self.node_for_inode(ino) {
+        if ino == FETCHFS_JSON_INO {
+            let attr = self.fetchfs_json_attr(&state);
+            reply.attr(&TTL, &attr);
+            return;
+        }
+        let node = match state.node_for_inode(ino) {
             Some(node) => node,
             None => {
                 reply.error(ENOENT);
@@ -244,16 +308,17 @@ impl Filesystem for FuseFS {
         };
         let entry = node
             .entry_index
-            .and_then(|idx| self.fs.manifest.entries.get(idx));
+            .and_then(|idx| state.manifest.entries.get(idx));
         let attr = self.file_attr(ino, entry);
         reply.attr(&TTL, &attr);
     }
 
     fn access(&mut self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.access(ino, mask, self.path_for_inode(ino));
+            tracer.access(ino, mask, self.resolve_path_for_trace(ino, &state));
         }
-        if self.node_for_inode(ino).is_none() {
+        if ino != FETCHFS_JSON_INO && state.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
         }
@@ -272,15 +337,16 @@ impl Filesystem for FuseFS {
         size: u32,
         reply: ReplyXattr,
     ) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
             tracer.getxattr(
                 ino,
                 name.to_string_lossy().as_ref(),
                 size,
-                self.path_for_inode(ino),
+                self.resolve_path_for_trace(ino, &state),
             );
         }
-        if self.node_for_inode(ino).is_none() {
+        if ino != FETCHFS_JSON_INO && state.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
         }
@@ -288,10 +354,11 @@ impl Filesystem for FuseFS {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.listxattr(ino, size, self.path_for_inode(ino));
+            tracer.listxattr(ino, size, self.resolve_path_for_trace(ino, &state));
         }
-        if self.node_for_inode(ino).is_none() {
+        if ino != FETCHFS_JSON_INO && state.node_for_inode(ino).is_none() {
             reply.error(ENOENT);
             return;
         }
@@ -306,10 +373,11 @@ impl Filesystem for FuseFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.readdir(ino, fh, offset, self.path_for_inode(ino));
+            tracer.readdir(ino, fh, offset, state.path_for_inode(ino));
         }
-        let node = match self.node_for_inode(ino) {
+        let node = match state.node_for_inode(ino) {
             Some(node) => node,
             None => {
                 reply.error(ENOENT);
@@ -322,16 +390,16 @@ impl Filesystem for FuseFS {
         }
         let mut entries: Vec<(u64, FileType, OsString)> = Vec::new();
         entries.push((ino, FileType::Directory, OsString::from(".")));
-        entries.push((1, FileType::Directory, OsString::from("..")));
+        entries.push((ROOT_INO, FileType::Directory, OsString::from("..")));
 
-        if let Some(children) = self.fs.list_dir(&node.path) {
+        if let Some(children) = state.tree.list_dir(&node.path) {
             for child in children {
                 let child_path = if node.path.is_empty() {
                     child.name.clone()
                 } else {
                     format!("{}/{}", node.path, child.name)
                 };
-                if let Some(child_ino) = self.inode_for_path(&child_path) {
+                if let Some(child_ino) = state.inode_for_path(&child_path) {
                     let kind = if child.is_dir {
                         FileType::Directory
                     } else {
@@ -352,22 +420,33 @@ impl Filesystem for FuseFS {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.open(ino, flags, self.path_for_inode(ino));
+            tracer.open(ino, flags, self.resolve_path_for_trace(ino, &state));
         }
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
             reply.error(EROFS);
             return;
         }
-        let node = match self.node_for_inode(ino) {
+        if ino == FETCHFS_JSON_INO {
+            let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
+            let mut handles = self.handles.lock().expect("handles lock");
+            handles.insert(fh, None);
+            reply.opened(fh, 0);
+            return;
+        }
+        let node = match state.node_for_inode(ino) {
             Some(node) => node,
             None => {
                 reply.error(ENOENT);
                 return;
             }
         };
-        let entry_index = match node.entry_index {
-            Some(index) => index,
+        let entry = match node
+            .entry_index
+            .and_then(|idx| state.manifest.entries.get(idx))
+        {
+            Some(entry) => entry.clone(),
             None => {
                 reply.error(ENOENT);
                 return;
@@ -375,7 +454,7 @@ impl Filesystem for FuseFS {
         };
         let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
         let mut handles = self.handles.lock().expect("handles lock");
-        handles.insert(fh, entry_index);
+        handles.insert(fh, Some(entry));
         reply.opened(fh, 0);
     }
 
@@ -391,32 +470,45 @@ impl Filesystem for FuseFS {
         reply: ReplyData,
     ) {
         if let Some(tracer) = &self.tracer {
-            tracer.read(ino, fh, offset, size, self.path_for_inode(ino));
+            let state = self.state.load();
+            tracer.read(
+                ino,
+                fh,
+                offset,
+                size,
+                self.resolve_path_for_trace(ino, &state),
+            );
         }
-        let entry_index = {
+        let handle = {
             let handles = self.handles.lock().expect("handles lock");
             match handles.get(&fh) {
-                Some(index) => *index,
+                Some(h) => h.clone(),
                 None => {
                     reply.error(EIO);
                     return;
                 }
             }
         };
-        let entry = match self.fs.manifest.entries.get(entry_index) {
-            Some(entry) => entry,
-            None => {
-                reply.error(EIO);
-                return;
-            }
-        };
         if offset < 0 {
             reply.error(EIO);
             return;
         }
-        match self.fs.read_range(entry, offset as u64, size) {
-            Ok(data) => reply.data(&data),
-            Err(_) => reply.error(EIO),
+        match handle {
+            None => {
+                let state = self.state.load();
+                let content = &state.fetchfs_json_content;
+                let off = offset as usize;
+                if off >= content.len() {
+                    reply.data(&[]);
+                } else {
+                    let end = (off + size as usize).min(content.len());
+                    reply.data(&content[off..end]);
+                }
+            }
+            Some(entry) => match self.fs.read_range(&entry, offset as u64, size) {
+                Ok(data) => reply.data(&data),
+                Err(_) => reply.error(EIO),
+            },
         }
     }
 
@@ -430,8 +522,15 @@ impl Filesystem for FuseFS {
         flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.release(ino, fh, flags, flush, self.path_for_inode(ino));
+            tracer.release(
+                ino,
+                fh,
+                flags,
+                flush,
+                self.resolve_path_for_trace(ino, &state),
+            );
         }
         let mut handles = self.handles.lock().expect("handles lock");
         handles.remove(&fh);
@@ -439,8 +538,14 @@ impl Filesystem for FuseFS {
     }
 
     fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
-            tracer.flush(ino, fh, lock_owner, self.path_for_inode(ino));
+            tracer.flush(
+                ino,
+                fh,
+                lock_owner,
+                self.resolve_path_for_trace(ino, &state),
+            );
         }
         reply.ok();
     }
@@ -457,6 +562,7 @@ impl Filesystem for FuseFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let state = self.state.load();
         if let Some(tracer) = &self.tracer {
             tracer.write(
                 ino,
@@ -464,7 +570,7 @@ impl Filesystem for FuseFS {
                 offset,
                 data.len() as u32,
                 flags,
-                self.path_for_inode(ino),
+                self.resolve_path_for_trace(ino, &state),
             );
         }
         reply.error(EROFS);
@@ -474,54 +580,169 @@ impl Filesystem for FuseFS {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Cache;
-    use crate::download_gate::DownloadGate;
-    use crate::filesystem::FetchFs;
-    use crate::http::HttpClient;
-    use crate::manifest::{Manifest, ManifestEntry};
 
     #[test]
     fn inode_mapping_includes_root_dirs_and_files() {
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![
-                ManifestEntry {
-                    path: "data/file.txt".to_string(),
-                    url: "http://127.0.0.1:1".to_string(),
-                    size: Some(1),
-                    mtime: None,
-                },
-                ManifestEntry {
-                    path: "data/sub/other.txt".to_string(),
-                    url: "http://127.0.0.1:1".to_string(),
-                    size: Some(2),
-                    mtime: None,
-                },
+                ManifestEntry::test_remote("data/file.txt", "http://127.0.0.1:1", Some(1)),
+                ManifestEntry::test_remote("data/sub/other.txt", "http://127.0.0.1:1", Some(2)),
             ],
         };
         let tree = manifest.build_tree().expect("tree");
-        let cache_dir = tempfile::tempdir().expect("tempdir");
-        let cache = Cache::new(
-            cache_dir.path(),
-            std::sync::Arc::new(crate::cache::LruTracker::new(u64::MAX)),
-        );
-        let http = HttpClient::new(0, 0, 100, 100).expect("client");
-        let fs = FetchFs::new(
-            manifest,
-            tree,
-            cache,
-            None,
-            std::sync::Arc::new(http),
-            std::sync::Arc::new(DownloadGate::new(1)),
-            std::sync::Arc::new(crate::download_pool::DownloadPool::new(1)),
-            false,
-        );
-        let fuse = FuseFS::new(fs, None);
+        let state = MountState::build(manifest, tree);
 
-        assert!(fuse.inode_for_path("").is_some());
-        assert!(fuse.inode_for_path("data").is_some());
-        assert!(fuse.inode_for_path("data/sub").is_some());
-        assert!(fuse.inode_for_path("data/file.txt").is_some());
-        assert!(fuse.inode_for_path("data/sub/other.txt").is_some());
+        assert!(state.inode_for_path("").is_some());
+        assert!(state.inode_for_path("data").is_some());
+        assert!(state.inode_for_path("data/sub").is_some());
+        assert!(state.inode_for_path("data/file.txt").is_some());
+        assert!(state.inode_for_path("data/sub/other.txt").is_some());
+    }
+
+    #[test]
+    fn inode_mapping_works_with_inline_entries() {
+        let manifest = Manifest {
+            version: 1,
+            revision: String::new(),
+            entries: vec![
+                ManifestEntry::test_inline("data/inline.txt", b"hello"),
+                ManifestEntry::test_remote("data/remote.txt", "http://127.0.0.1:1", Some(10)),
+            ],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree);
+
+        assert!(state.inode_for_path("data/inline.txt").is_some());
+        assert!(state.inode_for_path("data/remote.txt").is_some());
+    }
+
+    #[test]
+    fn fetchfs_json_content_with_revision() {
+        let manifest = Manifest {
+            version: 1,
+            revision: "abc123".to_string(),
+            entries: vec![],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree);
+
+        let content: serde_json::Value =
+            serde_json::from_slice(&state.fetchfs_json_content).expect("json");
+        assert_eq!(content["version"], 1);
+        assert_eq!(content["revision"], "abc123");
+    }
+
+    #[test]
+    fn fetchfs_json_content_empty_revision() {
+        let manifest = Manifest {
+            version: 1,
+            revision: String::new(),
+            entries: vec![],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree);
+
+        let content: serde_json::Value =
+            serde_json::from_slice(&state.fetchfs_json_content).expect("json");
+        assert_eq!(content["version"], 1);
+        assert_eq!(content["revision"], "");
+    }
+
+    #[test]
+    fn fetchfs_json_not_listed_in_root() {
+        let manifest = Manifest {
+            version: 1,
+            revision: "v1".to_string(),
+            entries: vec![ManifestEntry::test_remote("file.txt", "http://127.0.0.1:1", Some(1))],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree);
+
+        let root_entries = state.tree.list_dir("").expect("root listing");
+        assert!(
+            root_entries.iter().all(|e| e.name != FETCHFS_JSON_NAME),
+            ".fetchfs.json should not appear in directory listing"
+        );
+    }
+
+    #[test]
+    fn fetchfs_json_lookup_resolves_in_root() {
+        let manifest = Manifest {
+            version: 1,
+            revision: "v1".to_string(),
+            entries: vec![ManifestEntry::test_remote("file.txt", "http://127.0.0.1:1", Some(1))],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree);
+
+        assert!(
+            state.inode_for_path(FETCHFS_JSON_NAME).is_none(),
+            ".fetchfs.json should not be in the inode map"
+        );
+    }
+
+    #[test]
+    fn mount_state_rebuild_updates_revision_and_files() {
+        let manifest_v1 = Manifest {
+            version: 1,
+            revision: "rev1".to_string(),
+            entries: vec![ManifestEntry::test_remote("old.txt", "http://127.0.0.1:1/old", Some(1))],
+        };
+        let tree_v1 = manifest_v1.build_tree().expect("tree");
+        let state_v1 = MountState::build(manifest_v1, tree_v1);
+
+        assert!(state_v1.inode_for_path("old.txt").is_some());
+        assert!(state_v1.inode_for_path("new.txt").is_none());
+        let v1_json: serde_json::Value =
+            serde_json::from_slice(&state_v1.fetchfs_json_content).expect("json");
+        assert_eq!(v1_json["revision"], "rev1");
+
+        let manifest_v2 = Manifest {
+            version: 1,
+            revision: "rev2".to_string(),
+            entries: vec![ManifestEntry::test_remote("new.txt", "http://127.0.0.1:1/new", Some(2))],
+        };
+        let tree_v2 = manifest_v2.build_tree().expect("tree");
+        let state_v2 = MountState::build(manifest_v2, tree_v2);
+
+        assert!(state_v2.inode_for_path("old.txt").is_none());
+        assert!(state_v2.inode_for_path("new.txt").is_some());
+        let v2_json: serde_json::Value =
+            serde_json::from_slice(&state_v2.fetchfs_json_content).expect("json");
+        assert_eq!(v2_json["revision"], "rev2");
+    }
+
+    #[test]
+    fn arc_swap_state_swap_is_atomic() {
+        let manifest = Manifest {
+            version: 1,
+            revision: "initial".to_string(),
+            entries: vec![ManifestEntry::test_remote("file.txt", "http://127.0.0.1:1", Some(1))],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = Arc::new(ArcSwap::from_pointee(MountState::build(manifest, tree)));
+
+        let loaded = state.load();
+        let json: serde_json::Value =
+            serde_json::from_slice(&loaded.fetchfs_json_content).expect("json");
+        assert_eq!(json["revision"], "initial");
+        assert!(loaded.inode_for_path("file.txt").is_some());
+
+        let new_manifest = Manifest {
+            version: 1,
+            revision: "updated".to_string(),
+            entries: vec![ManifestEntry::test_remote("other.txt", "http://127.0.0.1:1", Some(2))],
+        };
+        let new_tree = new_manifest.build_tree().expect("tree");
+        state.store(Arc::new(MountState::build(new_manifest, new_tree)));
+
+        let loaded = state.load();
+        let json: serde_json::Value =
+            serde_json::from_slice(&loaded.fetchfs_json_content).expect("json");
+        assert_eq!(json["revision"], "updated");
+        assert!(loaded.inode_for_path("file.txt").is_none());
+        assert!(loaded.inode_for_path("other.txt").is_some());
     }
 }
