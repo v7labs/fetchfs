@@ -232,6 +232,9 @@ impl FuseFS {
     }
 
     fn cached_size(&self, entry: &ManifestEntry) -> Option<u64> {
+        if let Some(data) = entry.inline_data() {
+            return Some(data.len() as u64);
+        }
         let cache_entry = self.fs.cache_entry_for(entry).ok()?;
         if !cache_entry.data_path.exists() {
             return None;
@@ -586,18 +589,8 @@ mod tests {
             version: 1,
             revision: String::new(),
             entries: vec![
-                ManifestEntry {
-                    path: "data/file.txt".to_string(),
-                    url: "http://127.0.0.1:1".to_string(),
-                    size: Some(1),
-                    mtime: None,
-                },
-                ManifestEntry {
-                    path: "data/sub/other.txt".to_string(),
-                    url: "http://127.0.0.1:1".to_string(),
-                    size: Some(2),
-                    mtime: None,
-                },
+                ManifestEntry::test_remote("data/file.txt", "http://127.0.0.1:1", Some(1)),
+                ManifestEntry::test_remote("data/sub/other.txt", "http://127.0.0.1:1", Some(2)),
             ],
         };
         let tree = manifest.build_tree().expect("tree");
@@ -608,6 +601,23 @@ mod tests {
         assert!(state.inode_for_path("data/sub").is_some());
         assert!(state.inode_for_path("data/file.txt").is_some());
         assert!(state.inode_for_path("data/sub/other.txt").is_some());
+    }
+
+    #[test]
+    fn inode_mapping_works_with_inline_entries() {
+        let manifest = Manifest {
+            version: 1,
+            revision: String::new(),
+            entries: vec![
+                ManifestEntry::test_inline("data/inline.txt", b"hello"),
+                ManifestEntry::test_remote("data/remote.txt", "http://127.0.0.1:1", Some(10)),
+            ],
+        };
+        let tree = manifest.build_tree().expect("tree");
+        let state = MountState::build(manifest, tree, 0);
+
+        assert!(state.inode_for_path("data/inline.txt").is_some());
+        assert!(state.inode_for_path("data/remote.txt").is_some());
     }
 
     #[test]
@@ -647,12 +657,11 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             revision: "v1".to_string(),
-            entries: vec![ManifestEntry {
-                path: "file.txt".to_string(),
-                url: "http://127.0.0.1:1".to_string(),
-                size: Some(1),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "file.txt",
+                "http://127.0.0.1:1",
+                Some(1),
+            )],
         };
         let tree = manifest.build_tree().expect("tree");
         let state = MountState::build(manifest, tree, 0);
@@ -669,12 +678,11 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             revision: "v1".to_string(),
-            entries: vec![ManifestEntry {
-                path: "file.txt".to_string(),
-                url: "http://127.0.0.1:1".to_string(),
-                size: Some(1),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "file.txt",
+                "http://127.0.0.1:1",
+                Some(1),
+            )],
         };
         let tree = manifest.build_tree().expect("tree");
         let state = MountState::build(manifest, tree, 0);
@@ -690,12 +698,11 @@ mod tests {
         let manifest_v1 = Manifest {
             version: 1,
             revision: "rev1".to_string(),
-            entries: vec![ManifestEntry {
-                path: "old.txt".to_string(),
-                url: "http://127.0.0.1:1/old".to_string(),
-                size: Some(1),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "old.txt",
+                "http://127.0.0.1:1/old",
+                Some(1),
+            )],
         };
         let tree_v1 = manifest_v1.build_tree().expect("tree");
         let state_v1 = MountState::build(manifest_v1, tree_v1, 0);
@@ -709,12 +716,11 @@ mod tests {
         let manifest_v2 = Manifest {
             version: 1,
             revision: "rev2".to_string(),
-            entries: vec![ManifestEntry {
-                path: "new.txt".to_string(),
-                url: "http://127.0.0.1:1/new".to_string(),
-                size: Some(2),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "new.txt",
+                "http://127.0.0.1:1/new",
+                Some(2),
+            )],
         };
         let tree_v2 = manifest_v2.build_tree().expect("tree");
         let state_v2 = MountState::build(manifest_v2, tree_v2, 1);
@@ -731,12 +737,11 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             revision: "initial".to_string(),
-            entries: vec![ManifestEntry {
-                path: "file.txt".to_string(),
-                url: "http://127.0.0.1:1".to_string(),
-                size: Some(1),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "file.txt",
+                "http://127.0.0.1:1",
+                Some(1),
+            )],
         };
         let tree = manifest.build_tree().expect("tree");
         let state = Arc::new(ArcSwap::from_pointee(MountState::build(manifest, tree, 0)));
@@ -750,12 +755,11 @@ mod tests {
         let new_manifest = Manifest {
             version: 1,
             revision: "updated".to_string(),
-            entries: vec![ManifestEntry {
-                path: "other.txt".to_string(),
-                url: "http://127.0.0.1:1".to_string(),
-                size: Some(2),
-                mtime: None,
-            }],
+            entries: vec![ManifestEntry::test_remote(
+                "other.txt",
+                "http://127.0.0.1:1",
+                Some(2),
+            )],
         };
         let new_tree = new_manifest.build_tree().expect("tree");
         state.store(Arc::new(MountState::build(new_manifest, new_tree, 1)));

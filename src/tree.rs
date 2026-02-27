@@ -84,18 +84,12 @@ mod tests {
     #[test]
     fn tree_lookup_and_list_dir() {
         let entries = vec![
-            ManifestEntry {
-                path: "data/file1.txt".to_string(),
-                url: "https://example.com/file1.txt".to_string(),
-                size: Some(1),
-                mtime: None,
-            },
-            ManifestEntry {
-                path: "data/sub/file2.txt".to_string(),
-                url: "https://example.com/file2.txt".to_string(),
-                size: Some(1),
-                mtime: None,
-            },
+            ManifestEntry::test_remote("data/file1.txt", "https://example.com/file1.txt", Some(1)),
+            ManifestEntry::test_remote(
+                "data/sub/file2.txt",
+                "https://example.com/file2.txt",
+                Some(1),
+            ),
         ];
         let tree = PathTree::build(&entries).expect("tree build");
 
@@ -109,5 +103,20 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "data" && entry.is_dir)
         );
+    }
+
+    #[test]
+    fn tree_works_with_inline_entries() {
+        let entries = vec![
+            ManifestEntry::test_inline("dir/inline.txt", b"content"),
+            ManifestEntry::test_remote("dir/remote.txt", "https://example.com/f", Some(5)),
+        ];
+        let tree = PathTree::build(&entries).expect("tree build");
+
+        assert_eq!(tree.lookup("dir/inline.txt"), Some(0));
+        assert_eq!(tree.lookup("dir/remote.txt"), Some(1));
+
+        let dir_entries = tree.list_dir("dir").expect("dir entries");
+        assert_eq!(dir_entries.len(), 2);
     }
 }
