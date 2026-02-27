@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 arc-swap = "1.8.2"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
+flate2 = "1.1.9"
 fs2 = "0.4"
 hex = "0.4"
 httpdate = "1.0"
