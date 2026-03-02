@@ -13,6 +13,8 @@ use crate::tree::PathTree;
 pub struct Manifest {
     #[allow(dead_code)]
     pub version: u32,
+    #[serde(default)]
+    pub revision: String,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -107,6 +109,21 @@ mod tests {
     fn normalize_accepts_absolute_and_relative() {
         assert_eq!(normalize_path("/data/file.txt").unwrap(), "data/file.txt");
         assert_eq!(normalize_path("data/file.txt").unwrap(), "data/file.txt");
+    }
+
+    #[test]
+    fn deserialize_version_and_revision() {
+        let json = r#"{"version":1,"revision":"abc123","entries":[]}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.revision, "abc123");
+    }
+
+    #[test]
+    fn deserialize_revision_defaults_to_empty() {
+        let json = r#"{"version":1,"entries":[]}"#;
+        let manifest: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.revision, "");
     }
 
     #[test]
