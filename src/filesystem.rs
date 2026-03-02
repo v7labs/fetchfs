@@ -11,12 +11,9 @@ use crate::cache::{BlockCache, BlockMeta, Cache, CacheEntry, CacheMeta};
 use crate::download_gate::DownloadGate;
 use crate::download_pool::DownloadPool;
 use crate::http::{HttpClient, RangeStatus};
-use crate::manifest::{Manifest, ManifestEntry};
-use crate::tree::{DirEntry, PathTree};
+use crate::manifest::ManifestEntry;
 
 pub struct FetchFs {
-    pub manifest: Manifest,
-    pub tree: PathTree,
     pub cache: Cache,
     pub block_cache: Option<BlockCache>,
     pub downloader: Arc<HttpClient>,
@@ -29,8 +26,6 @@ pub struct FetchFs {
 impl FetchFs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        manifest: Manifest,
-        tree: PathTree,
         cache: Cache,
         block_cache: Option<BlockCache>,
         downloader: Arc<HttpClient>,
@@ -39,8 +34,6 @@ impl FetchFs {
         streaming: bool,
     ) -> Self {
         Self {
-            manifest,
-            tree,
             cache,
             block_cache,
             downloader,
@@ -49,10 +42,6 @@ impl FetchFs {
             streaming,
             mount_time: Utc::now(),
         }
-    }
-
-    pub fn list_dir(&self, path: &str) -> Option<Vec<DirEntry>> {
-        self.tree.list_dir(path)
     }
 
     pub fn cache_entry_for(&self, entry: &ManifestEntry) -> std::io::Result<CacheEntry> {
@@ -346,6 +335,7 @@ fn read_from_path(path: &PathBuf, offset: u64, size: u32) -> std::io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::Manifest;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -357,6 +347,7 @@ mod tests {
     fn read_range_zero_size_returns_empty() {
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![ManifestEntry {
                 path: "data/file.txt".to_string(),
                 url: "http://127.0.0.1:1".to_string(),
@@ -364,7 +355,6 @@ mod tests {
                 mtime: None,
             }],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::new(
             cache_dir.path(),
@@ -373,8 +363,6 @@ mod tests {
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 100, 100).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             block_cache,
             Arc::new(downloader),
@@ -383,7 +371,7 @@ mod tests {
             false,
         );
 
-        let entry = fs.manifest.entries.first().expect("entry");
+        let entry = manifest.entries.first().expect("entry");
         let data = fs.read_range(entry, 0, 0).expect("read");
         assert!(data.is_empty());
     }
@@ -432,6 +420,7 @@ mod tests {
 
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![ManifestEntry {
                 path: "data/file.txt".to_string(),
                 url: format!("http://{}", addr),
@@ -439,7 +428,6 @@ mod tests {
                 mtime: None,
             }],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let cache = Cache::new(
             cache_dir.path(),
@@ -448,8 +436,6 @@ mod tests {
         let block_cache = Some(BlockCache::new(cache_dir.path().join("blocks"), 4096));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             block_cache,
             Arc::new(downloader),
@@ -460,7 +446,7 @@ mod tests {
         let fs = Arc::new(fs);
         let fs_first = Arc::clone(&fs);
         let fs_second = Arc::clone(&fs);
-        let entry = fs.manifest.entries[0].clone();
+        let entry = manifest.entries[0].clone();
         let entry_first = entry.clone();
         let entry_second = entry.clone();
 
@@ -561,6 +547,7 @@ mod tests {
         let mtime = Some(chrono::Utc::now());
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![
                 ManifestEntry {
                     path: "file_0".to_string(),
@@ -582,14 +569,11 @@ mod tests {
                 },
             ],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let tracker = Arc::new(crate::cache::LruTracker::new(250));
         let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             None,
             Arc::new(downloader),
@@ -599,12 +583,12 @@ mod tests {
         );
 
         for i in 0..3 {
-            fs.ensure_cached(&fs.manifest.entries[i]).expect("cache");
+            fs.ensure_cached(&manifest.entries[i]).expect("cache");
         }
 
-        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
-        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
-        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        let entry0 = fs.cache_entry_for(&manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&manifest.entries[2]).expect("entry");
         assert!(
             !entry0.data_path.exists(),
             "file_0 should be evicted (oldest)"
@@ -613,7 +597,7 @@ mod tests {
         assert!(entry2.data_path.exists(), "file_2 should remain");
         assert_eq!(total_calls.load(Ordering::SeqCst), 3);
 
-        fs.ensure_cached(&fs.manifest.entries[0]).expect("re-cache");
+        fs.ensure_cached(&manifest.entries[0]).expect("re-cache");
         assert_eq!(
             total_calls.load(Ordering::SeqCst),
             4,
@@ -632,6 +616,7 @@ mod tests {
         let mtime = Some(chrono::Utc::now());
         let manifest = Manifest {
             version: 1,
+            revision: String::new(),
             entries: vec![
                 ManifestEntry {
                     path: "file_0".to_string(),
@@ -653,14 +638,11 @@ mod tests {
                 },
             ],
         };
-        let tree = manifest.build_tree().expect("tree");
         let cache_dir = tempfile::tempdir().expect("tempdir");
         let tracker = Arc::new(crate::cache::LruTracker::new(250));
         let cache = Cache::new(cache_dir.path(), Arc::clone(&tracker));
         let downloader = HttpClient::new(0, 0, 1000, 2000).expect("client");
         let fs = FetchFs::new(
-            manifest,
-            tree,
             cache,
             None,
             Arc::new(downloader),
@@ -669,17 +651,17 @@ mod tests {
             false,
         );
 
-        fs.ensure_cached(&fs.manifest.entries[0]).expect("cache A");
-        fs.ensure_cached(&fs.manifest.entries[1]).expect("cache B");
+        fs.ensure_cached(&manifest.entries[0]).expect("cache A");
+        fs.ensure_cached(&manifest.entries[1]).expect("cache B");
 
-        fs.read_range(&fs.manifest.entries[0], 0, 10)
+        fs.read_range(&manifest.entries[0], 0, 10)
             .expect("touch A via read");
 
-        fs.ensure_cached(&fs.manifest.entries[2]).expect("cache C");
+        fs.ensure_cached(&manifest.entries[2]).expect("cache C");
 
-        let entry0 = fs.cache_entry_for(&fs.manifest.entries[0]).expect("entry");
-        let entry1 = fs.cache_entry_for(&fs.manifest.entries[1]).expect("entry");
-        let entry2 = fs.cache_entry_for(&fs.manifest.entries[2]).expect("entry");
+        let entry0 = fs.cache_entry_for(&manifest.entries[0]).expect("entry");
+        let entry1 = fs.cache_entry_for(&manifest.entries[1]).expect("entry");
+        let entry2 = fs.cache_entry_for(&manifest.entries[2]).expect("entry");
         assert!(
             entry0.data_path.exists(),
             "file_0 should survive (was touched)"
