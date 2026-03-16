@@ -188,7 +188,7 @@ impl FuseFS {
             perm: if kind == FileType::Directory {
                 0o555
             } else {
-                0o444
+                0o644
             },
             nlink: 1,
             uid: self.uid,
